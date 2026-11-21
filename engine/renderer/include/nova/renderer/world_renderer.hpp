@@ -34,12 +34,12 @@ enum class Material : u8 {
 // Lighting and atmosphere for one view. Defaults give a late-afternoon sun.
 struct WorldSettings {
     math::Vec3 sun_direction{0.8f, 0.27f, -0.36f}; // towards the sun
-    math::Vec3 sun_color{1.0f, 0.74f, 0.50f};
-    f32 sun_intensity = 4.6f;
+    math::Vec3 sun_color{1.0f, 0.80f, 0.65f};
+    f32 sun_intensity = 2.85f;
     math::Vec3 sky_zenith{0.10f, 0.25f, 0.62f};
     math::Vec3 sky_horizon{0.56f, 0.68f, 0.86f};
     math::Vec3 ground_color{0.42f, 0.30f, 0.20f};
-    f32 ambient = 0.7f;
+    f32 ambient = 0.56f;
     f32 fog_density = 0.0006f;
     f32 fog_height_falloff = 0.016f;
     f32 exposure = 0.68f;
@@ -54,8 +54,8 @@ struct WorldSettings {
     f32 ssao = 0.8f;         // 0 disables
     f32 ssao_radius = 0.7f;  // metres
     f32 bounce = 0.45f;      // screen-space colour bleed
-    f32 bloom = 0.25f;
-    f32 saturation = 1.06f;
+    f32 bloom = 0.14f;
+    f32 saturation = 1.0f;
     // Internal resolution relative to the back buffer: 1.5 = supersampling ("ultra"), < 1 = faster.
     f32 render_scale = 1.0f;
     // One unshadowed point light (muzzle flash, torch...); zero colour disables it.

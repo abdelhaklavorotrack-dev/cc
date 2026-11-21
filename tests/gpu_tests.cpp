@@ -166,18 +166,28 @@ TEST_CASE("gpu: world renderer casts sun shadows through the shadow map") {
         std::vector<u8> rgba;
         REQUIRE(device->read_back(rgba));
         const math::Mat4 vp = camera.projection(1.0f) * camera.view();
-        auto luma_at = [&](math::Vec3 p) {
+        auto sample_at = [&](math::Vec3 p) {
             const math::Vec4 c = vp * math::Vec4{p.x, p.y, p.z, 1};
             const u32 x = static_cast<u32>((c.x / c.w * 0.5f + 0.5f) * kW);
             const u32 y = static_cast<u32>((c.y / c.w * 0.5f + 0.5f) * kH);
-            const Pixel px = pixel_at(rgba, kW, std::min(x, kW - 1), std::min(y, kH - 1));
-            return px.r + px.g + px.b;
+            return pixel_at(rgba, kW, std::min(x, kW - 1), std::min(y, kH - 1));
         };
-        const int lit = luma_at({2.5f, 0, 0});
-        const int shadowed = luma_at({-1.4f, 0, 0});
+        const auto sum = [](Pixel p) { return p.r + p.g + p.b; };
+        const int lit = sum(sample_at({2.5f, 0, 0}));
+        const int shadowed = sum(sample_at({-1.4f, 0, 0}));
         INFO("lit=" << lit << " shadowed=" << shadowed);
         CHECK(lit > 0);
         CHECK(shadowed * 10 < lit * 6);
+
+        // Under achromatic lighting, neither contact occlusion nor the grade should tint grey stone.
+        settings.sun_color = {1, 1, 1};
+        settings.sky_zenith = settings.sky_horizon = {0.5f, 0.5f, 0.5f};
+        settings.ground_color = {0.3f, 0.3f, 0.3f};
+        REQUIRE(world.render_frame(camera, settings, items));
+        REQUIRE(device->read_back(rgba));
+        for (auto p : {sample_at({2.5f, 0, 0}), sample_at({-1.4f, 0, 0})}) {
+            CHECK(std::max({p.r, p.g, p.b}) - std::min({p.r, p.g, p.b}) <= 2);
+        }
     }
     CHECK(device->validation_error_count() == 0);
 }

@@ -305,9 +305,8 @@ float sample_shadow(float3 p, float3 n) {
     return lit / 12.0;
 }
 
-// Contact AO from a top-down height map of the level: anything standing taller than the surface
-// within a radius darkens it with a warm, earthy tint (wall bases, alleys, under eaves).
-float3 contact_ao(float3 p, float3 n) {
+// Occlusion attenuates indirect light, not the hue of the receiving material.
+float contact_ao(float3 p, float3 n) {
     const float strength = frame.camera_clip.z;
     const float R = frame.height_params.w;
     if (strength <= 0.0) {
@@ -334,8 +333,7 @@ float3 contact_ao(float3 p, float3 n) {
         occ += saturate((h - p.y - 0.2) / (R * 0.8)) * w;
         wsum += w;
     }
-    float ao = 1.0 - strength * saturate(occ / wsum * 1.15) * 0.75;
-    return lerp(float3(0.5, 0.34, 0.24), 1.0, smoothstep(0.2, 1.0, ao));
+    return 1.0 - saturate(strength) * saturate(occ / wsum) * 0.65;
 }
 
 struct Surface {
@@ -372,7 +370,7 @@ Surface terrain_surface(float3 p, float3 n) {
     c = lerp(c, rock, rock_w);
     c = lerp(c, snow, snow_w);
     s.albedo = c;
-    s.normal = bump(n, p, rock_w > 0.5 ? 0.35 : 1.8, rock_w > 0.5 ? 0.6 : 0.25);
+    s.normal = bump(n, p, rock_w > 0.5 ? 0.35 : 1.8, rock_w > 0.5 ? 0.32 : 0.12);
     s.roughness = lerp(0.95, 0.6, snow_w);
     s.emissive = 0;
     s.translucency = 0;
@@ -403,10 +401,10 @@ Surface make_surface(int id, float3 base, float3 p, float3 n, float4 vcolor) {
         s.albedo = lerp(s.albedo, float3(0.45, 0.39, 0.33), peel);
         s.normal = bump(n, p, 3.0, 0.12 + peel * 0.4);
     } else if (id == MAT_STONE) {
-        float v = fbm(p * 3.0, 4);
-        s.albedo = base * (0.75 + 0.5 * v);
+        float v = fbm(p * 10.0, 4);
+        s.albedo = base * (0.50 + 0.80 * v);
         s.albedo = lerp(s.albedo, float3(0.30, 0.32, 0.22), smoothstep(0.62, 0.75, fbm(p * 1.3, 3)) * 0.5); // lichen
-        s.normal = bump(n, p, 2.5, 0.7);
+        s.normal = bump(n, p, 2.5, 0.16);
         s.roughness = 0.9;
     } else if (id == MAT_WOOD) {
         float grain = sin((p.y + p.x * 0.2 + fbm(p * float3(2, 18, 2), 3) * 0.8) * 55.0) * 0.5 + 0.5;
@@ -417,7 +415,7 @@ Surface make_surface(int id, float3 base, float3 p, float3 n, float4 vcolor) {
         // High-frequency breakup reads as individual leaves and gaps at a distance.
         float leaves = value_noise(p * 9.0) * 0.6 + value_noise(p * 23.0) * 0.4;
         s.albedo = base * (0.55 + 0.6 * fbm(p * 2.2, 3)) * (0.35 + 0.9 * leaves);
-        s.normal = bump(n, p, 6.0, 1.2);
+        s.normal = bump(n, p, 6.0, 0.12);
         s.translucency = 0.45;
         s.roughness = 0.7;
     } else if (id == MAT_GRASS) {
@@ -489,31 +487,24 @@ float3 env_brdf(float3 f0, float roughness, float ndv) {
     return f0 * ab.x + ab.y;
 }
 
-// Shared lighting for procedural (id >= 0) and asset (id < 0) surfaces. `geom_n` is the
-// interpolated geometric normal facing the viewer; s.normal is the shading normal.
-float3 light_surface(Surface s, int id, float3 p, float3 geom_n) {
+// Both material paths use the geometric normal for sky fill and the shading normal for detail.
+float3 light_surface(Surface s, float3 p, float3 geom_n) {
     float3 n = s.normal;
     float3 v = normalize(frame.camera_pos.xyz - p);
     float3 l = frame.sun_dir.xyz;
     float ndl = saturate(dot(n, l));
     float shadow = sample_shadow(p, geom_n);
 
-    // Contact occlusion: village surfaces darken towards the ground they stand on.
-    float ao = id < 0 || id == MAT_TERRAIN || id == MAT_WATER ? 1.0 : lerp(0.3, 1.0, saturate(p.y / 1.6));
-    ao *= lerp(0.8, 1.0, saturate(n.y * 0.5 + 0.5)) * s.occlusion;
-
-    // Hemisphere ambient: sky from above, warm sunlit-ground bounce from below.
-    float3 sky_amb = frame.sky_zenith.rgb * 0.9 + frame.sky_horizon.rgb * 0.3;
-    // Partly desaturated so shade reads warm-neutral, not blue (matches the reference look).
-    sky_amb = lerp(dot(sky_amb, float3(0.2126, 0.7152, 0.0722)) * float3(1.08, 1.0, 0.9), sky_amb, 0.55);
-    float3 ground_amb = frame.ground_color.rgb * frame.sun_color.rgb * 0.4;
-    float3 ambient = lerp(ground_amb, sky_amb, n.y * 0.5 + 0.5) * frame.ground_color.w;
-
-    float3 cao = contact_ao(p, geom_n);
+    // Broad sky fill follows the surface, not each fine bump. Bounce includes skylight
+    // even where the low sun contributes little to the ground.
+    float3 sky_amb = lerp(frame.sky_horizon.rgb, frame.sky_zenith.rgb, 0.35);
+    float3 ground_amb = frame.ground_color.rgb * (sky_amb + frame.sun_color.rgb * saturate(l.y));
+    float3 ambient = lerp(ground_amb, sky_amb, geom_n.y * 0.5 + 0.5) * frame.ground_color.w;
+    float ao = s.occlusion * contact_ao(p, geom_n);
     float3 diffuse_albedo = s.albedo * (1.0 - s.metallic);
     float3 f0 = lerp(float3(0.04, 0.04, 0.04), s.albedo, s.metallic);
-    float3 direct = frame.sun_color.rgb * ndl * shadow * lerp(1.0, cao, 0.5);
-    float3 color = diffuse_albedo * (direct + ambient * ao * cao);
+    float3 direct = frame.sun_color.rgb * ndl * shadow;
+    float3 color = diffuse_albedo * (direct + ambient * ao);
     // Procedural rough materials keep only a faint sheen; otherwise dusty ground glows at grazing angles.
     float spec_scale = s.env_spec > 0.0 ? 1.0 : lerp(1.0, 0.15, smoothstep(0.6, 0.95, s.roughness));
     color += frame.sun_color.rgb * ggx_specular(n, v, l, s.roughness, f0) * ndl * shadow * spec_scale;
@@ -524,7 +515,7 @@ float3 light_surface(Surface s, int id, float3 p, float3 geom_n) {
         float ndv = saturate(dot(n, v)) + 1e-3;
         float3 r = reflect(-v, n);
         float3 env = lerp(sky_color(r) * frame.ground_color.w, ambient, saturate(s.roughness * 1.4));
-        color += env * env_brdf(f0, s.roughness, ndv) * ao * cao * lerp(0.4, 1.0, shadow) * s.env_spec;
+        color += env * env_brdf(f0, s.roughness, ndv) * ao * s.env_spec;
     }
     if (s.translucency > 0.0) {
         float back = saturate(dot(-n, l)) * pow(saturate(dot(-v, l)), 2.0);
@@ -562,7 +553,7 @@ float4 mainFS(VSOutput input, bool front_face : SV_IsFrontFace) : SV_Target {
     s.metallic = 0.0;
     s.occlusion = 1.0;
     s.env_spec = 0.0;
-    return float4(light_surface(s, id, p, n), 1.0);
+    return float4(light_surface(s, p, n), 1.0);
 }
 
 // Emissive factors are relative to a sunlit white surface rather than absolute nits.
@@ -597,7 +588,7 @@ float4 assetFS(VSOutput input, bool front_face : SV_IsFrontFace) : SV_Target {
     s.translucency = 0.0;
     s.wetness = 0.0;
     s.env_spec = 1.0;
-    return float4(light_surface(s, -1, p, geom_n), 1.0);
+    return float4(light_surface(s, p, geom_n), 1.0);
 }
 
 // ------------------------------------------------------------------ post: SSAO + colour bleed
@@ -781,14 +772,10 @@ float4 postFS(FullscreenOut input) : SV_Target {
         c = (l_b < l_min || l_b > l_max) ? a : b;
     }
 
-    // Warm grade: vignette, saturation (a touch more in the shadows), warm shadow tint, contrast.
-    float dist = distance(uv, 0.5);
-    c *= smoothstep(0.95, 0.35, dist) * 0.4 + 0.6;
+    // The sun supplies the warmth; keep neutral shadows neutral after tonemapping.
+    c *= 1.0 - 0.10 * smoothstep(0.35, 0.71, distance(uv, 0.5));
     float l = dot(c, float3(0.2126, 0.7152, 0.0722));
-    float k = smoothstep(0.0, 0.6, l);
-    c = lerp(float3(l, l, l), c, frame.post_params.y * (1.0 + 0.1 * (1.0 - k)));
-    c *= lerp(float3(1.06, 0.97, 0.86), float3(1.03, 1.0, 0.95), k);
-    c = saturate((c - 0.18) * 1.1 + 0.18);
+    c = saturate(lerp(l.xxx, c, frame.post_params.y));
 
     // Crosshair: four arms around the centre with a dark outline.
     const float arm = frame.point_color.w;

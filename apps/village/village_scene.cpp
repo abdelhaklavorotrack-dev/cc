@@ -146,7 +146,7 @@ public:
                          renderer::material_color(m, albedo));
     }
 
-    // Irregular angular stone: a box whose eight corners are jittered, with flat-shaded faces.
+    // Tilt the shading normals towards the corners so light rolls across each uneven stone.
     void stone(MeshData& dst, const Vec3& center, const Vec3& radii, f32 yaw, const Vec3& albedo, Material m) {
         std::array<Vec3, 8> corner_offset;
         for (Vec3& o : corner_offset) {
@@ -163,7 +163,8 @@ public:
             const Vec3 n = math::normalize(math::cross(s.vertices[s.indices[f + 1]].position - v0.position,
                                                        s.vertices[s.indices[f + 2]].position - v0.position));
             for (usize k = 0; k < 6; ++k) {
-                s.vertices[s.indices[f + k]].normal = n;
+                auto& vertex = s.vertices[s.indices[f + k]];
+                vertex.normal = math::normalize(n + math::normalize(vertex.position) * 0.55f);
             }
         }
         renderer::append(dst, s, place(center, radii, yaw), renderer::material_color(m, albedo));
