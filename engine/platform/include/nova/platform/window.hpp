@@ -41,6 +41,8 @@ public:
     [[nodiscard]] virtual Backend backend() const noexcept = 0;
     // Backend window handle (SDL_Window* for SDL3, nullptr for Headless). For the RHI only.
     [[nodiscard]] virtual void* native_handle() const noexcept = 0;
+    // FPS-style mouse: hides the cursor and reports unbounded relative motion. No-op when headless.
+    virtual void set_mouse_captured(bool /*captured*/) {}
 };
 
 // Returns nullptr (and logs) if the requested backend is unavailable or creation fails.
