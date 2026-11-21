@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <format>
@@ -129,6 +130,7 @@ struct Frame {
 VkFormat to_vk(Format f) {
     switch (f) {
     case Format::RGBA8_sRGB: return VK_FORMAT_R8G8B8A8_SRGB;
+    case Format::RGBA8_Unorm: return VK_FORMAT_R8G8B8A8_UNORM;
     case Format::RGBA16_Float: return VK_FORMAT_R16G16B16A16_SFLOAT;
     case Format::D32_Float: return VK_FORMAT_D32_SFLOAT;
     case Format::Undefined:
@@ -228,7 +230,9 @@ public:
     Pipeline* pipeline(PipelineHandle h) { return pipelines_.get(h.id); }
     Texture* texture(TextureHandle h) { return textures_.get(h.id); }
     VkDevice vk_device() const { return device_; }
-    VkSampler sampler(Filter f) const { return f == Filter::Linear ? linear_sampler_ : nearest_sampler_; }
+    VkSampler sampler(Filter f) const {
+        return f == Filter::Linear ? linear_sampler_ : (f == Filter::Nearest ? nearest_sampler_ : material_sampler_);
+    }
     VkImage back_buffer_image() const { return swapchain_ ? swap_images_[image_index_] : offscreen_.image; }
     VkImageView back_buffer_view() const { return swapchain_ ? swap_views_[image_index_] : offscreen_.view; }
     const Image& depth() const { return depth_; }
@@ -250,8 +254,9 @@ private:
     bool create_depth();
     void destroy_targets();
     std::optional<u32> find_memory_type(u32 type_bits, VkMemoryPropertyFlags props) const;
+    bool upload_texture(Texture& t, const void* rgba, u32 mip_levels);
     bool allocate_image(VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect, VkExtent2D extent,
-                        Image& out);
+                        Image& out, u32 mip_levels = 1);
     void destroy_image(Image& img);
     bool create_raw_buffer(usize size, VkBufferUsageFlags usage, Buffer& out);
     void destroy_raw_buffer(Buffer& b);
@@ -293,6 +298,8 @@ private:
     SlotPool<Texture> textures_;
     VkSampler linear_sampler_ = VK_NULL_HANDLE;
     VkSampler nearest_sampler_ = VK_NULL_HANDLE;
+    VkSampler material_sampler_ = VK_NULL_HANDLE;
+    f32 max_anisotropy_ = 0.0f; // 0 = feature unavailable
 
     f64 gpu_ms_ = -1.0;
     std::atomic<u32> validation_errors_{0};
@@ -473,6 +480,7 @@ bool VulkanDevice::pick_physical_device() {
             info_.api_version = version_string(props.apiVersion);
             info_.software = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
             timestamp_period_ns_ = props.limits.timestampPeriod;
+            max_anisotropy_ = f2.features.samplerAnisotropy ? std::min(16.0f, props.limits.maxSamplerAnisotropy) : 0.0f;
             const u32 bits = qprops[*family].timestampValidBits;
             timestamp_mask_ = bits >= 64 ? ~0ull : ((1ull << bits) - 1);
             info_.gpu_timing = bits > 0 && props.limits.timestampPeriod > 0;
@@ -501,8 +509,11 @@ bool VulkanDevice::create_device() {
     VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f13};
     f11.shaderDrawParameters = VK_TRUE;
 
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11};
+    f2.features.samplerAnisotropy = max_anisotropy_ > 0.0f ? VK_TRUE : VK_FALSE;
+
     const char* swapchain_ext = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
-    VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f11};
+    VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2};
     ci.queueCreateInfoCount = 1;
     ci.pQueueCreateInfos = &qci;
     ci.enabledExtensionCount = surface_ ? 1 : 0;
@@ -536,11 +547,11 @@ bool VulkanDevice::create_frames() {
             return false;
         }
         const std::array<VkDescriptorPoolSize, 2> sizes{{
-            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1024},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024},
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4096},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768}, // per-draw material sets
         }};
         VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        dpci.maxSets = 1024;
+        dpci.maxSets = 4096;
         dpci.poolSizeCount = static_cast<u32>(sizes.size());
         dpci.pPoolSizes = sizes.data();
         if (!vk_ok(vkCreateDescriptorPool(device_, &dpci, nullptr, &f.descriptors), "vkCreateDescriptorPool")) {
@@ -557,6 +568,19 @@ bool VulkanDevice::create_frames() {
         sci.maxLod = VK_LOD_CLAMP_NONE;
         VkSampler& out = filter == Filter::Linear ? linear_sampler_ : nearest_sampler_;
         if (!vk_ok(vkCreateSampler(device_, &sci, nullptr, &out), "vkCreateSampler")) {
+            return false;
+        }
+    }
+    {
+        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter = VK_FILTER_LINEAR;
+        sci.minFilter = VK_FILTER_LINEAR;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sci.anisotropyEnable = max_anisotropy_ > 0.0f ? VK_TRUE : VK_FALSE;
+        sci.maxAnisotropy = std::max(1.0f, max_anisotropy_);
+        sci.maxLod = VK_LOD_CLAMP_NONE;
+        if (!vk_ok(vkCreateSampler(device_, &sci, nullptr, &material_sampler_), "vkCreateSampler")) {
             return false;
         }
     }
@@ -581,12 +605,12 @@ std::optional<u32> VulkanDevice::find_memory_type(u32 type_bits, VkMemoryPropert
 }
 
 bool VulkanDevice::allocate_image(VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect,
-                                  VkExtent2D extent, Image& out) {
+                                  VkExtent2D extent, Image& out, u32 mip_levels) {
     VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = format;
     ici.extent = {extent.width, extent.height, 1};
-    ici.mipLevels = 1;
+    ici.mipLevels = mip_levels;
     ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -613,7 +637,7 @@ bool VulkanDevice::allocate_image(VkFormat format, VkImageUsageFlags usage, VkIm
     vci.image = out.image;
     vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vci.format = format;
-    vci.subresourceRange = {aspect, 0, 1, 0, 1};
+    vci.subresourceRange = {aspect, 0, mip_levels, 0, 1};
     return vk_ok(vkCreateImageView(device_, &vci, nullptr, &out.view), "vkCreateImageView");
 }
 
@@ -755,6 +779,7 @@ VulkanDevice::~VulkanDevice() {
         textures_.for_each([&](Texture& t) { destroy_image(t.image); });
         if (linear_sampler_) vkDestroySampler(device_, linear_sampler_, nullptr);
         if (nearest_sampler_) vkDestroySampler(device_, nearest_sampler_, nullptr);
+        if (material_sampler_) vkDestroySampler(device_, material_sampler_, nullptr);
         destroy_targets();
         destroy_image(offscreen_);
         if (swapchain_) vkDestroySwapchainKHR(device_, swapchain_, nullptr);
@@ -1007,11 +1032,99 @@ TextureHandle VulkanDevice::create_texture(const TextureDesc& desc) {
     if (desc.sampled) {
         usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
     }
-    if (!allocate_image(t.format, usage, t.aspect, t.extent, t.image)) {
+    u32 mip_levels = 1;
+    if (desc.initial_data) {
+        NOVA_VERIFY(!desc.render_target && (t.format == VK_FORMAT_R8G8B8A8_SRGB || t.format == VK_FORMAT_R8G8B8A8_UNORM),
+                    "initial texture data needs a sampled-only RGBA8 texture");
+        usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if (desc.mipmaps) {
+            mip_levels = static_cast<u32>(std::bit_width(std::max(desc.width, desc.height)));
+        }
+    }
+    if (!allocate_image(t.format, usage, t.aspect, t.extent, t.image, mip_levels)) {
+        destroy_image(t.image);
+        return {};
+    }
+    if (desc.initial_data && !upload_texture(t, desc.initial_data, mip_levels)) {
         destroy_image(t.image);
         return {};
     }
     return {textures_.add(t)};
+}
+
+// Copies RGBA8 pixels into mip 0, blits the rest of the chain and leaves every level
+// SHADER_READ_ONLY. Synchronous: meant for load time, not for the middle of a frame.
+bool VulkanDevice::upload_texture(Texture& t, const void* rgba, u32 mip_levels) {
+    NOVA_VERIFY(!frame_active_, "textures with initial data must be created outside begin_frame/end_frame");
+    const usize bytes = static_cast<usize>(t.extent.width) * t.extent.height * 4;
+    Buffer staging;
+    if (!create_raw_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, staging)) {
+        return false;
+    }
+    std::memcpy(staging.mapped, rgba, bytes);
+    vkDeviceWaitIdle(device_);
+
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = frames_[frame_index_].pool; // idle after the wait above
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(device_, &ai, &cmd);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+
+    auto barrier = [&](u32 level, u32 count, VkImageLayout from, VkImageLayout to, VkPipelineStageFlags2 src_stage,
+                       VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
+        VkImageMemoryBarrier2 b = image_barrier(t.image.image, VK_IMAGE_ASPECT_COLOR_BIT, from, to, src_stage,
+                                                src_access, dst_stage, dst_access);
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, count, 0, 1};
+        cmd_barriers(cmd, {&b, 1});
+    };
+    constexpr auto kTransfer = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    barrier(0, mip_levels, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_NONE,
+            VK_ACCESS_2_NONE, kTransfer, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {t.extent.width, t.extent.height, 1};
+    vkCmdCopyBufferToImage(cmd, staging.buffer, t.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    i32 w = static_cast<i32>(t.extent.width);
+    i32 h = static_cast<i32>(t.extent.height);
+    for (u32 level = 1; level < mip_levels; ++level) {
+        barrier(level - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, kTransfer,
+                VK_ACCESS_2_TRANSFER_WRITE_BIT, kTransfer, VK_ACCESS_2_TRANSFER_READ_BIT);
+        const i32 nw = std::max(1, w / 2);
+        const i32 nh = std::max(1, h / 2);
+        VkImageBlit blit{};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1, 0, 1};
+        blit.srcOffsets[1] = {w, h, 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+        blit.dstOffsets[1] = {nw, nh, 1};
+        vkCmdBlitImage(cmd, t.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t.image.image,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+        barrier(level - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                kTransfer, VK_ACCESS_2_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        w = nw;
+        h = nh;
+    }
+    barrier(mip_levels - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            kTransfer, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    vkEndCommandBuffer(cmd);
+
+    VkCommandBufferSubmitInfo cmd_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    cmd_info.commandBuffer = cmd;
+    VkSubmitInfo2 submit{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    submit.commandBufferInfoCount = 1;
+    submit.pCommandBufferInfos = &cmd_info;
+    const bool ok = vk_ok(vkQueueSubmit2(queue_, 1, &submit, VK_NULL_HANDLE), "texture upload submit") &&
+                    vk_ok(vkQueueWaitIdle(queue_), "vkQueueWaitIdle");
+    vkFreeCommandBuffers(device_, frames_[frame_index_].pool, 1, &cmd);
+    destroy_raw_buffer(staging);
+    t.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    return ok;
 }
 
 void VulkanDevice::destroy(TextureHandle handle) {

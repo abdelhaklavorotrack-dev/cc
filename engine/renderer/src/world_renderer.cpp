@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <initializer_list>
 #include <vector>
 
@@ -47,9 +48,19 @@ void set4(f32 (&dst)[4], const Vec3& v, f32 w) {
 enum ShaderSlot {
     kSkyVS, kSkyFS, kShadowVS, kShadowFS, kMainVS, kMainFS,
     kPostVS, kPostFS, kCompositeFS, kBloomDownFS, kBloomBlurHFS, kBloomBlurVFS,
+    kShadowAssetVS, kShadowAssetFS, kAssetFS,
     kShaderCount
 };
 constexpr u32 kHeightMapSize = 1024;
+
+// Must match ObjectData in world.slang.
+struct ObjectPush {
+    Mat4 model;
+    f32 base_color[4];
+    f32 material[4]; // metallic, roughness, alpha cutoff, normal scale
+    f32 emissive[4]; // rgb, occlusion strength
+};
+static_assert(sizeof(ObjectPush) == 112);
 
 constexpr rhi::Format kHdrFormat = rhi::Format::RGBA16_Float;
 
@@ -68,6 +79,8 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
         {"postVS", rhi::ShaderStage::Vertex},   {"postFS", rhi::ShaderStage::Fragment},
         {"compositeFS", rhi::ShaderStage::Fragment}, {"bloomDownFS", rhi::ShaderStage::Fragment},
         {"bloomBlurHFS", rhi::ShaderStage::Fragment}, {"bloomBlurVFS", rhi::ShaderStage::Fragment},
+        {"shadowAssetVS", rhi::ShaderStage::Vertex}, {"shadowAssetFS", rhi::ShaderStage::Fragment},
+        {"assetFS", rhi::ShaderStage::Fragment},
     };
     for (int i = 0; i < kShaderCount; ++i) {
         shaders_[i] = device_.create_shader({world_spv, entries[i].name, entries[i].stage});
@@ -82,6 +95,8 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
         {0, rhi::VertexFormat::Float3, static_cast<u32>(offsetof(Vertex, position))},
         {1, rhi::VertexFormat::Float3, static_cast<u32>(offsetof(Vertex, normal))},
         {2, rhi::VertexFormat::Float4, static_cast<u32>(offsetof(Vertex, color))},
+        {3, rhi::VertexFormat::Float2, static_cast<u32>(offsetof(Vertex, uv))},
+        {4, rhi::VertexFormat::Float4, static_cast<u32>(offsetof(Vertex, tangent))},
     };
 
     rhi::GraphicsPipelineDesc shadow;
@@ -89,7 +104,7 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
     shadow.fragment_shader = shaders_[kShadowFS];
     shadow.vertex_stride = sizeof(Vertex);
     shadow.attributes = attributes;
-    shadow.push_constant_size = sizeof(Mat4);
+    shadow.push_constant_size = sizeof(ObjectPush);
     shadow.bindings = {frame_binding};
     shadow.cull = rhi::CullMode::None; // thin walls and foliage must cast from both sides
     shadow.depth_bias = true;
@@ -110,7 +125,7 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
     main.fragment_shader = shaders_[kMainFS];
     main.vertex_stride = sizeof(Vertex);
     main.attributes = attributes;
-    main.push_constant_size = sizeof(Mat4);
+    main.push_constant_size = sizeof(ObjectPush);
     main.bindings = {frame_binding,
                      {1, rhi::BindingType::SampledTexture, rhi::Filter::Nearest},
                      {5, rhi::BindingType::SampledTexture, rhi::Filter::Nearest}};
@@ -118,6 +133,30 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
     main_pipeline_ = device_.create_graphics_pipeline(main);
     main.cull = rhi::CullMode::None;
     main_two_sided_pipeline_ = device_.create_graphics_pipeline(main);
+
+    using BT = rhi::BindingType;
+    rhi::GraphicsPipelineDesc asset = main;
+    asset.fragment_shader = shaders_[kAssetFS];
+    for (u32 b = 7; b <= 11; ++b) {
+        asset.bindings.push_back({b, BT::SampledTexture, rhi::Filter::Material});
+    }
+    asset.cull = rhi::CullMode::Back;
+    asset_pipeline_ = device_.create_graphics_pipeline(asset);
+    asset.cull = rhi::CullMode::None;
+    asset_two_sided_pipeline_ = device_.create_graphics_pipeline(asset);
+
+    rhi::GraphicsPipelineDesc asset_shadow = shadow;
+    asset_shadow.vertex_shader = shaders_[kShadowAssetVS];
+    asset_shadow.fragment_shader = shaders_[kShadowAssetFS];
+    asset_shadow.bindings = {frame_binding, {7, BT::SampledTexture, rhi::Filter::Material}};
+    asset_shadow_pipeline_ = device_.create_graphics_pipeline(asset_shadow);
+
+    // 1x1 fallbacks for materials without a given texture.
+    const u8 white[4] = {255, 255, 255, 255};
+    const u8 flat[4] = {128, 128, 255, 255};
+    white_srgb_ = device_.create_texture({1, 1, rhi::Format::RGBA8_sRGB, false, true, white});
+    white_linear_ = device_.create_texture({1, 1, rhi::Format::RGBA8_Unorm, false, true, white});
+    flat_normal_ = device_.create_texture({1, 1, rhi::Format::RGBA8_Unorm, false, true, flat});
 
     auto fullscreen = [&](ShaderSlot fs, std::vector<rhi::BindingDesc> bindings, rhi::Format color) {
         rhi::GraphicsPipelineDesc desc;
@@ -130,7 +169,6 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
         desc.color_format = color;
         return device_.create_graphics_pipeline(desc);
     };
-    using BT = rhi::BindingType;
     composite_pipeline_ = fullscreen(kCompositeFS,
                                      {frame_binding,
                                       {2, BT::SampledTexture, rhi::Filter::Linear},
@@ -154,7 +192,9 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
     height_frame_buffer_ = device_.create_buffer({sizeof(FrameData), rhi::BufferUsage::Uniform, nullptr});
 
     valid_ = shadow_pipeline_.valid() && sky_pipeline_.valid() && main_pipeline_.valid() &&
-             main_two_sided_pipeline_.valid() && composite_pipeline_.valid() && bloom_down_pipeline_.valid() &&
+             main_two_sided_pipeline_.valid() && asset_pipeline_.valid() && asset_two_sided_pipeline_.valid() &&
+             asset_shadow_pipeline_.valid() && white_srgb_.valid() && white_linear_.valid() && flat_normal_.valid() &&
+             composite_pipeline_.valid() && bloom_down_pipeline_.valid() &&
              bloom_blur_h_pipeline_.valid() && bloom_blur_v_pipeline_.valid() && post_pipeline_.valid() &&
              shadow_map_.valid() && height_map_.valid() && height_frame_buffer_.valid() &&
              std::ranges::all_of(frame_buffers_, [](rhi::BufferHandle b) { return b.valid(); });
@@ -172,10 +212,15 @@ WorldRenderer::~WorldRenderer() {
         device_.destroy(b);
     }
     device_.destroy(height_frame_buffer_);
-    for (rhi::TextureHandle t : {hdr_target_, scene_depth_, lit_target_, bloom_a_, bloom_b_, shadow_map_, height_map_}) {
+    for (rhi::TextureHandle t : owned_textures_) {
+        device_.destroy(t);
+    }
+    for (rhi::TextureHandle t : {hdr_target_, scene_depth_, lit_target_, bloom_a_, bloom_b_, shadow_map_, height_map_,
+                                 white_srgb_, white_linear_, flat_normal_}) {
         device_.destroy(t);
     }
     for (rhi::PipelineHandle p : {shadow_pipeline_, sky_pipeline_, main_pipeline_, main_two_sided_pipeline_,
+                                  asset_pipeline_, asset_two_sided_pipeline_, asset_shadow_pipeline_,
                                   composite_pipeline_, bloom_down_pipeline_, bloom_blur_h_pipeline_,
                                   bloom_blur_v_pipeline_, post_pipeline_}) {
         device_.destroy(p);
@@ -202,6 +247,103 @@ MeshId WorldRenderer::upload(const MeshData& mesh) {
     }
     meshes_.push_back(gpu);
     return {static_cast<u32>(meshes_.size())};
+}
+
+rhi::TextureHandle WorldRenderer::upload_texture(const ImageData& image, bool srgb) {
+    if (image.width == 0 || image.height == 0 ||
+        image.rgba.size() < static_cast<usize>(image.width) * image.height * 4) {
+        return {};
+    }
+    rhi::TextureDesc desc;
+    desc.width = image.width;
+    desc.height = image.height;
+    desc.format = srgb ? rhi::Format::RGBA8_sRGB : rhi::Format::RGBA8_Unorm;
+    desc.render_target = false;
+    desc.sampled = true;
+    desc.initial_data = image.rgba.data();
+    desc.mipmaps = true;
+    const rhi::TextureHandle t = device_.create_texture(desc);
+    if (t.valid()) {
+        owned_textures_.push_back(t);
+    }
+    return t;
+}
+
+MaterialId WorldRenderer::add_material(const PbrMaterial& material) {
+    PbrMaterial m = material;
+    auto fallback = [](rhi::TextureHandle& t, rhi::TextureHandle def) {
+        if (!t.valid()) {
+            t = def;
+        }
+    };
+    fallback(m.base_color, white_srgb_);
+    fallback(m.metallic_roughness, white_linear_);
+    fallback(m.normal, flat_normal_);
+    fallback(m.occlusion, white_linear_);
+    fallback(m.emissive, white_srgb_);
+    materials_.push_back(m);
+    return {static_cast<u32>(materials_.size())};
+}
+
+std::vector<WorldDrawItem> WorldRenderer::upload_model(const ModelData& model, const Mat4& placement) {
+    // Each image is uploaded once per colour space it is used in.
+    std::vector<rhi::TextureHandle> srgb(model.images.size()), linear(model.images.size());
+    auto texture = [&](i32 index, bool is_srgb) -> rhi::TextureHandle {
+        if (index < 0 || static_cast<usize>(index) >= model.images.size()) {
+            return {};
+        }
+        rhi::TextureHandle& slot = (is_srgb ? srgb : linear)[static_cast<usize>(index)];
+        if (!slot.valid()) {
+            slot = upload_texture(model.images[static_cast<usize>(index)], is_srgb);
+        }
+        return slot;
+    };
+    std::vector<MaterialId> materials;
+    std::vector<bool> double_sided;
+    for (const MaterialData& src : model.materials) {
+        PbrMaterial m;
+        m.base_color = texture(src.base_color_image, true);
+        m.metallic_roughness = texture(src.metallic_roughness_image, false);
+        m.normal = texture(src.normal_image, false);
+        m.occlusion = texture(src.occlusion_image, false);
+        m.emissive = texture(src.emissive_image, true);
+        m.base_color_factor = src.base_color_factor;
+        m.metallic = src.metallic_factor;
+        m.roughness = src.roughness_factor;
+        m.emissive_factor = src.emissive_factor;
+        m.normal_scale = src.normal_scale;
+        m.occlusion_strength = src.occlusion_strength;
+        m.alpha_cutoff = src.alpha_mode == AlphaMode::Mask    ? std::max(src.alpha_cutoff, 1e-3f)
+                         : src.alpha_mode == AlphaMode::Blend ? 0.5f
+                                                              : 0.0f;
+        m.double_sided = src.double_sided;
+        materials.push_back(add_material(m));
+        double_sided.push_back(src.double_sided);
+    }
+    MaterialId default_material;
+
+    std::vector<WorldDrawItem> items;
+    for (const ModelPrimitive& prim : model.primitives) {
+        WorldDrawItem item;
+        item.mesh = upload(prim.mesh);
+        if (item.mesh.id == 0) {
+            continue;
+        }
+        item.transform = placement * prim.transform;
+        if (prim.material >= 0 && static_cast<usize>(prim.material) < materials.size()) {
+            item.material = materials[static_cast<usize>(prim.material)];
+            item.two_sided = double_sided[static_cast<usize>(prim.material)];
+        } else {
+            if (!default_material.valid()) {
+                PbrMaterial m;
+                m.metallic = 0.0f;
+                default_material = add_material(m);
+            }
+            item.material = default_material;
+        }
+        items.push_back(item);
+    }
+    return items;
 }
 
 bool WorldRenderer::ensure_targets(rhi::Extent extent) {
@@ -291,12 +433,28 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
             return;
         }
         const GpuMesh& mesh = meshes_[item.mesh.id - 1];
-        cmd->push_constants(&item.transform, sizeof(Mat4));
+        if (item.material.valid()) {
+            const PbrMaterial& m = materials_[item.material.id - 1];
+            ObjectPush push{};
+            push.model = item.transform;
+            std::memcpy(push.base_color, &m.base_color_factor, sizeof(push.base_color));
+            push.material[0] = m.metallic;
+            push.material[1] = m.roughness;
+            push.material[2] = m.alpha_cutoff;
+            push.material[3] = m.normal_scale;
+            set4(push.emissive, m.emissive_factor, m.occlusion_strength);
+            cmd->push_constants(&push, sizeof(push));
+        } else {
+            cmd->push_constants(&item.transform, sizeof(Mat4));
+        }
         cmd->bind_vertex_buffer(mesh.vertices);
         cmd->bind_index_buffer(mesh.indices);
         cmd->draw_indexed(mesh.index_count);
         ++stats_.draw_calls;
         stats_.triangles += mesh.index_count / 3;
+    };
+    auto valid_material = [&](const WorldDrawItem& item) {
+        return item.material.valid() && item.material.id <= materials_.size();
     };
     // Depth-only render of the shadow casters with `light_view_proj` taken from `constants`.
     auto depth_pass = [&](rhi::TextureHandle target, const rhi::ResourceBinding& constants) {
@@ -307,9 +465,22 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
         cmd->bind_pipeline(shadow_pipeline_);
         cmd->bind_resources({&constants, 1});
         for (const WorldDrawItem& item : items) {
-            if (item.casts_shadow) {
+            if (item.casts_shadow && !item.material.valid()) {
                 draw_mesh(item);
             }
+        }
+        bool asset_bound = false;
+        for (const WorldDrawItem& item : items) {
+            if (!item.casts_shadow || !valid_material(item)) {
+                continue;
+            }
+            if (!asset_bound) {
+                cmd->bind_pipeline(asset_shadow_pipeline_);
+                asset_bound = true;
+            }
+            const rhi::ResourceBinding res[] = {constants, {7, {}, materials_[item.material.id - 1].base_color}};
+            cmd->bind_resources(res);
+            draw_mesh(item);
         }
         cmd->end_render_pass();
     };
@@ -357,9 +528,29 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
             cmd->bind_pipeline(two_sided ? main_two_sided_pipeline_ : main_pipeline_);
             cmd->bind_resources(main_res);
             for (const WorldDrawItem& item : items) {
-                if (item.two_sided == two_sided) {
+                if (item.two_sided == two_sided && !item.material.valid()) {
                     draw_mesh(item);
                 }
+            }
+        }
+        // Imported assets: one descriptor set per draw for its material textures.
+        for (bool two_sided : {false, true}) {
+            bool bound = false;
+            for (const WorldDrawItem& item : items) {
+                if (!valid_material(item) || item.two_sided != two_sided) {
+                    continue;
+                }
+                if (!bound) {
+                    cmd->bind_pipeline(two_sided ? asset_two_sided_pipeline_ : asset_pipeline_);
+                    bound = true;
+                }
+                const PbrMaterial& m = materials_[item.material.id - 1];
+                const rhi::ResourceBinding res[] = {
+                    frame_res, {1, {}, shadow_map_}, {5, {}, height_map_}, {7, {}, m.base_color},
+                    {8, {}, m.metallic_roughness}, {9, {}, m.normal}, {10, {}, m.occlusion}, {11, {}, m.emissive},
+                };
+                cmd->bind_resources(res);
+                draw_mesh(item);
             }
         }
         cmd->end_render_pass();

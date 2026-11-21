@@ -16,6 +16,11 @@ namespace nova::math {
 inline constexpr f32 kPi = std::numbers::pi_v<f32>;
 [[nodiscard]] constexpr f32 radians(f32 degrees) noexcept { return degrees * kPi / 180.0f; }
 
+struct Vec2 {
+    f32 x = 0, y = 0;
+    constexpr bool operator==(const Vec2&) const noexcept = default;
+};
+
 struct Vec3 {
     f32 x = 0, y = 0, z = 0;
 

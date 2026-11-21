@@ -28,9 +28,19 @@ struct FrameData {
 [[vk::binding(4, 0)]] Sampler2D<float4> bloom_tex;
 [[vk::binding(5, 0)]] Sampler2D<float> height_map; // top-down depth of the level
 [[vk::binding(6, 0)]] Sampler2D<float4> post_src;
+// Asset (glTF metallic-roughness) material textures.
+[[vk::binding(7, 0)]] Sampler2D<float4> base_color_tex;         // sRGB
+[[vk::binding(8, 0)]] Sampler2D<float4> metallic_roughness_tex; // G roughness, B metallic
+[[vk::binding(9, 0)]] Sampler2D<float4> normal_tex;             // tangent space
+[[vk::binding(10, 0)]] Sampler2D<float4> occlusion_tex;         // R
+[[vk::binding(11, 0)]] Sampler2D<float4> emissive_tex;          // sRGB
 
+// Must match ObjectPush in world_renderer.cpp. Procedural draws push only `model`.
 struct ObjectData {
     float4x4 model;
+    float4 base_color; // factor (linear rgba)
+    float4 material;   // x metallic, y roughness, z alpha cutoff (0 = opaque), w normal scale
+    float4 emissive;   // rgb factor, w occlusion strength
 };
 [[vk::push_constant]] ConstantBuffer<ObjectData> object;
 
@@ -190,6 +200,8 @@ struct VSInput {
     [[vk::location(0)]] float3 position;
     [[vk::location(1)]] float3 normal;
     [[vk::location(2)]] float4 color;
+    [[vk::location(3)]] float2 uv;
+    [[vk::location(4)]] float4 tangent;
 };
 
 [shader("vertex")]
@@ -201,6 +213,27 @@ float4 shadowVS(VSInput input) : SV_Position {
 [shader("fragment")]
 void shadowFS() {}
 
+// Asset shadow casters: alpha-tested foliage, fences etc. cut holes in the shadow.
+struct ShadowAssetOut {
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+[shader("vertex")]
+ShadowAssetOut shadowAssetVS(VSInput input) {
+    ShadowAssetOut o;
+    o.position = mul(frame.light_view_proj, mul(object.model, float4(input.position, 1.0)));
+    o.uv = input.uv;
+    return o;
+}
+
+[shader("fragment")]
+void shadowAssetFS(ShadowAssetOut input) {
+    if (object.material.z > 0.0 && base_color_tex.Sample(input.uv).a * object.base_color.a < object.material.z) {
+        discard;
+    }
+}
+
 // ------------------------------------------------------------------ main pass
 
 struct VSOutput {
@@ -208,6 +241,8 @@ struct VSOutput {
     float3 world_pos : POSITION0;
     float3 normal : NORMAL0;
     float4 color : COLOR0;
+    float2 uv : TEXCOORD0;
+    float4 tangent : TANGENT0;
 };
 
 [shader("vertex")]
@@ -226,6 +261,8 @@ VSOutput mainVS(VSInput input) {
     o.position = mul(frame.view_proj, world);
     o.normal = mul((float3x3)object.model, input.normal);
     o.color = input.color;
+    o.uv = input.uv;
+    o.tangent = float4(mul((float3x3)object.model, input.tangent.xyz), input.tangent.w);
     return o;
 }
 
@@ -305,6 +342,9 @@ struct Surface {
     float3 emissive;
     float translucency;
     float wetness; // 1 = water
+    float metallic;
+    float occlusion; // material AO (1 = none)
+    float env_spec;  // 1 = add sky-reflection ambient specular (asset materials)
 };
 
 Surface terrain_surface(float3 p, float3 n) {
@@ -422,7 +462,7 @@ Surface make_surface(int id, float3 base, float3 p, float3 n, float4 vcolor) {
     return s;
 }
 
-float ggx_specular(float3 n, float3 v, float3 l, float roughness) {
+float3 ggx_specular(float3 n, float3 v, float3 l, float roughness, float3 f0) {
     float3 h = normalize(v + l);
     float a = max(roughness * roughness, 0.002);
     float a2 = a * a;
@@ -432,29 +472,32 @@ float ggx_specular(float3 n, float3 v, float3 l, float roughness) {
     float ndl = saturate(dot(n, l));
     float k = a * 0.5;
     float vis = 1.0 / ((ndv * (1.0 - k) + k) * (ndl * (1.0 - k) + k));
-    float fresnel = 0.04 + 0.96 * pow(1.0 - saturate(dot(h, v)), 5.0);
+    float3 fresnel = f0 + (1.0 - f0) * pow(1.0 - saturate(dot(h, v)), 5.0);
     return d * vis * fresnel * 0.25;
 }
 
-[shader("fragment")]
-float4 mainFS(VSOutput input, bool front_face : SV_IsFrontFace) : SV_Target {
-    int id = int(input.color.a + 0.5);
-    float3 p = input.world_pos;
-    float3 n = normalize(input.normal);
-    if (!front_face) {
-        n = -n; // two-sided foliage, grass and flags
-    }
-    Surface s = make_surface(id, input.color.rgb, p, n, input.color);
-    n = s.normal;
+// Split-sum environment BRDF, analytic fit (Karis, "Physically Based Shading on Mobile").
+float3 env_brdf(float3 f0, float roughness, float ndv) {
+    const float4 c0 = float4(-1.0, -0.0275, -0.572, 0.022);
+    const float4 c1 = float4(1.0, 0.0425, 1.04, -0.04);
+    float4 r = roughness * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * ndv)) * r.x + r.y;
+    float2 ab = float2(-1.04, 1.04) * a004 + r.zw;
+    return f0 * ab.x + ab.y;
+}
 
+// Shared lighting for procedural (id >= 0) and asset (id < 0) surfaces. `geom_n` is the
+// interpolated geometric normal facing the viewer; s.normal is the shading normal.
+float3 light_surface(Surface s, int id, float3 p, float3 geom_n) {
+    float3 n = s.normal;
     float3 v = normalize(frame.camera_pos.xyz - p);
     float3 l = frame.sun_dir.xyz;
     float ndl = saturate(dot(n, l));
-    float shadow = sample_shadow(p, normalize(input.normal) * (front_face ? 1.0 : -1.0));
+    float shadow = sample_shadow(p, geom_n);
 
-    // Contact occlusion: surfaces darken towards the ground they stand on.
-    float ao = id == MAT_TERRAIN || id == MAT_WATER ? 1.0 : lerp(0.3, 1.0, saturate(p.y / 1.6));
-    ao *= lerp(0.8, 1.0, saturate(n.y * 0.5 + 0.5));
+    // Contact occlusion: village surfaces darken towards the ground they stand on.
+    float ao = id < 0 || id == MAT_TERRAIN || id == MAT_WATER ? 1.0 : lerp(0.3, 1.0, saturate(p.y / 1.6));
+    ao *= lerp(0.8, 1.0, saturate(n.y * 0.5 + 0.5)) * s.occlusion;
 
     // Hemisphere ambient: sky from above, warm sunlit-ground bounce from below.
     float3 sky_amb = frame.sky_zenith.rgb * 0.9 + frame.sky_horizon.rgb * 0.3;
@@ -463,13 +506,23 @@ float4 mainFS(VSOutput input, bool front_face : SV_IsFrontFace) : SV_Target {
     float3 ground_amb = frame.ground_color.rgb * frame.sun_color.rgb * 0.4;
     float3 ambient = lerp(ground_amb, sky_amb, n.y * 0.5 + 0.5) * frame.ground_color.w;
 
-    float3 cao = contact_ao(p, normalize(input.normal));
+    float3 cao = contact_ao(p, geom_n);
+    float3 diffuse_albedo = s.albedo * (1.0 - s.metallic);
+    float3 f0 = lerp(float3(0.04, 0.04, 0.04), s.albedo, s.metallic);
     float3 direct = frame.sun_color.rgb * ndl * shadow * lerp(1.0, cao, 0.5);
-    float3 color = s.albedo * (direct + ambient * ao * cao);
-    // Rough materials keep only a faint sheen; otherwise dusty ground glows at grazing angles.
-    float spec_scale = lerp(1.0, 0.15, smoothstep(0.6, 0.95, s.roughness));
-    color += frame.sun_color.rgb * ggx_specular(n, v, l, s.roughness) * ndl * shadow * spec_scale;
+    float3 color = diffuse_albedo * (direct + ambient * ao * cao);
+    // Procedural rough materials keep only a faint sheen; otherwise dusty ground glows at grazing angles.
+    float spec_scale = s.env_spec > 0.0 ? 1.0 : lerp(1.0, 0.15, smoothstep(0.6, 0.95, s.roughness));
+    color += frame.sun_color.rgb * ggx_specular(n, v, l, s.roughness, f0) * ndl * shadow * spec_scale;
 
+    if (s.env_spec > 0.0) {
+        // Image-based-style ambient specular from the procedural sky (no cubemap needed): sharp sky
+        // reflection for smooth surfaces, fading to the diffuse ambient as roughness grows.
+        float ndv = saturate(dot(n, v)) + 1e-3;
+        float3 r = reflect(-v, n);
+        float3 env = lerp(sky_color(r) * frame.ground_color.w, ambient, saturate(s.roughness * 1.4));
+        color += env * env_brdf(f0, s.roughness, ndv) * ao * cao * lerp(0.4, 1.0, shadow) * s.env_spec;
+    }
     if (s.translucency > 0.0) {
         float back = saturate(dot(-n, l)) * pow(saturate(dot(-v, l)), 2.0);
         color += s.albedo * frame.sun_color.rgb * back * s.translucency * shadow;
@@ -481,9 +534,57 @@ float4 mainFS(VSOutput input, bool front_face : SV_IsFrontFace) : SV_Target {
         color = lerp(color, sky_color(r) * lerp(0.35, 0.8, shadow), saturate(fresnel * 1.2 + 0.12));
     }
     color += s.emissive;
+    return apply_fog(color, p);
+}
 
-    color = apply_fog(color, p);
-    return float4(color, 1.0);
+[shader("fragment")]
+float4 mainFS(VSOutput input, bool front_face : SV_IsFrontFace) : SV_Target {
+    int id = int(input.color.a + 0.5);
+    float3 p = input.world_pos;
+    float3 n = normalize(input.normal);
+    if (!front_face) {
+        n = -n; // two-sided foliage, grass and flags
+    }
+    Surface s = make_surface(id, input.color.rgb, p, n, input.color);
+    s.metallic = 0.0;
+    s.occlusion = 1.0;
+    s.env_spec = 0.0;
+    return float4(light_surface(s, id, p, n), 1.0);
+}
+
+// Emissive factors are relative to a sunlit white surface rather than absolute nits.
+static const float kEmissiveScale = 4.0;
+
+[shader("fragment")]
+float4 assetFS(VSOutput input, bool front_face : SV_IsFrontFace) : SV_Target {
+    float4 base = base_color_tex.Sample(input.uv) * object.base_color * float4(input.color.rgb, 1.0);
+    if (object.material.z > 0.0 && base.a < object.material.z) {
+        discard;
+    }
+    float3 p = input.world_pos;
+    float3 geom_n = normalize(input.normal) * (front_face ? 1.0 : -1.0);
+    float3 n = geom_n;
+    float3 t = input.tangent.xyz;
+    if (dot(t, t) > 1e-10) {
+        t = normalize(t - geom_n * dot(geom_n, t));
+        float3 b = cross(geom_n, t) * (input.tangent.w < 0.0 ? -1.0 : 1.0);
+        float3 tn = normal_tex.Sample(input.uv).xyz * 2.0 - 1.0;
+        tn.xy *= object.material.w;
+        n = normalize(t * tn.x + b * tn.y + geom_n * max(tn.z, 1e-3));
+    }
+    float4 mr = metallic_roughness_tex.Sample(input.uv);
+
+    Surface s;
+    s.albedo = base.rgb;
+    s.normal = n;
+    s.metallic = saturate(object.material.x * mr.b);
+    s.roughness = clamp(object.material.y * mr.g, 0.04, 1.0);
+    s.occlusion = lerp(1.0, occlusion_tex.Sample(input.uv).r, object.emissive.w);
+    s.emissive = emissive_tex.Sample(input.uv).rgb * object.emissive.rgb * kEmissiveScale;
+    s.translucency = 0.0;
+    s.wetness = 0.0;
+    s.env_spec = 1.0;
+    return float4(light_surface(s, -1, p, geom_n), 1.0);
 }
 
 // ------------------------------------------------------------------ post: SSAO + colour bleed

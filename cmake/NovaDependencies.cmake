@@ -52,6 +52,23 @@ if(NOVA_WITH_VULKAN)
     target_include_directories(nova_volk SYSTEM PUBLIC ${volk_SOURCE_DIR})
     target_link_libraries(nova_volk PUBLIC nova_vulkan_headers ${CMAKE_DL_LIBS})
 
+    # glTF importer: cgltf (parser) + stb (image decode/encode), header-only, private to the renderer.
+    FetchContent_Declare(cgltf
+        URL https://github.com/jkuhlmann/cgltf/archive/refs/tags/v1.14.tar.gz
+        URL_HASH SHA256=2f3c97a6b989943f50e7d7f228688f6558fe37b1411c13a350e3560d061707d8
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        SOURCE_SUBDIR do-not-add)
+    FetchContent_Declare(stb
+        URL https://github.com/nothings/stb/archive/6b5799bae8a1fe3792691ef4b72ae26434c3e799.tar.gz
+        URL_HASH SHA256=87e9ecd2d2e0cb8fa35bf5a93ea6ca3999595ea4f0a4738ed1aac0a34cbd4da9
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        SOURCE_SUBDIR do-not-add)
+    FetchContent_MakeAvailable(cgltf stb)
+    add_library(nova_cgltf INTERFACE)
+    target_include_directories(nova_cgltf SYSTEM INTERFACE ${cgltf_SOURCE_DIR})
+    add_library(nova_stb INTERFACE)
+    target_include_directories(nova_stb SYSTEM INTERFACE ${stb_SOURCE_DIR})
+
     # Shader compiler: prefer slangc from PATH / Vulkan SDK, else the pinned release binary.
     find_program(NOVA_SLANGC slangc HINTS $ENV{VULKAN_SDK}/bin)
     if(NOT NOVA_SLANGC)

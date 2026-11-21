@@ -3,6 +3,7 @@
 //
 //   nova_village [--headless] [--frames N] [--width W --height H] [--no-vsync] [--validation]
 //                [--screenshot out.ppm]
+//                [--model file.glb|.gltf [--model-at X Z] [--model-scale S] [--model-yaw DEG]]
 //
 // Window controls: hold right mouse to look, WASD move, Q/E down/up, Shift faster, Esc quit.
 // Exit code 77 means no usable Vulkan device.
@@ -10,6 +11,7 @@
 #include "nova/core/log.hpp"
 #include "nova/core/time.hpp"
 #include "nova/platform/window.hpp"
+#include "nova/renderer/model.hpp"
 #include "nova/renderer/world_renderer.hpp"
 #include "nova/rhi/rhi.hpp"
 
@@ -18,6 +20,7 @@
 #include <charconv>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -514,6 +517,8 @@ int main(int argc, char** argv) {
     rhi::DeviceDesc ddesc;
     u64 max_frames = 0;
     std::string screenshot;
+    std::string model_path;
+    f32 model_x = 0.4f, model_z = 5.0f, model_scale = 1.0f, model_yaw = 0.0f;
 #if defined(NOVA_ENABLE_ASSERTS)
     ddesc.validation = true;
 #endif
@@ -532,6 +537,15 @@ int main(int argc, char** argv) {
             ddesc.vsync = false;
         } else if (arg == "--validation") {
             ddesc.validation = true;
+        } else if (arg == "--model" && has_value) {
+            model_path = argv[++i];
+        } else if (arg == "--model-at" && i + 2 < argc) {
+            model_x = std::strtof(argv[++i], nullptr);
+            model_z = std::strtof(argv[++i], nullptr);
+        } else if (arg == "--model-scale" && has_value) {
+            model_scale = std::strtof(argv[++i], nullptr);
+        } else if (arg == "--model-yaw" && has_value) {
+            model_yaw = std::strtof(argv[++i], nullptr);
         } else if (arg == "--screenshot" && has_value) {
             screenshot = argv[++i];
         }
@@ -571,8 +585,29 @@ int main(int argc, char** argv) {
         {world.upload(builder.two_sided), Mat4::identity(), true},
         {world.upload(builder.water), Mat4::identity(), false, false},
     };
-    const usize tris = (terrain.indices.size() + builder.opaque.indices.size() + builder.foliage.indices.size() +
-                        builder.two_sided.indices.size() + builder.water.indices.size()) / 3;
+    usize tris = (terrain.indices.size() + builder.opaque.indices.size() + builder.foliage.indices.size() +
+                  builder.two_sided.indices.size() + builder.water.indices.size()) / 3;
+    if (!model_path.empty()) {
+        // Imported glTF asset, standing on the terrain at (model_x, model_z).
+        std::string error;
+        const auto model = renderer::load_gltf(model_path, &error);
+        if (!model) {
+            NOVA_ERROR("Village", "could not load {}: {}", model_path, error);
+            return 1;
+        }
+        const Vec3 ground{model_x, terrain_height(model_x, model_z), model_z};
+        const Mat4 placement = math::translate(ground) * math::rotate({0, 1, 0}, math::radians(model_yaw)) *
+                               math::scale({model_scale, model_scale, model_scale}) *
+                               math::translate({0, -model->bounds_min.y, 0});
+        for (const renderer::WorldDrawItem& item : world.upload_model(*model, placement)) {
+            items.push_back(item);
+        }
+        for (const renderer::ModelPrimitive& p : model->primitives) {
+            tris += p.mesh.indices.size() / 3;
+        }
+        NOVA_INFO("Village", "loaded {}: {} primitives, {} materials, {} images", model_path,
+                  model->primitives.size(), model->materials.size(), model->images.size());
+    }
     NOVA_INFO("Village", "built scene in {:.0f} ms: {} triangles in {} draws", build_timer.elapsed_ms(), tris,
               items.size());
 
