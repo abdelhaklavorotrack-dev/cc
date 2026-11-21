@@ -11,6 +11,8 @@ struct Vertex {
     math::Vec3 normal;
     // rgb = linear albedo, a = material id (see WorldRenderer / world.slang). Ignored by Renderer.
     math::Vec4 color{1.0f, 1.0f, 1.0f, 0.0f};
+    math::Vec2 uv;      // TEXCOORD_0, glTF convention (v = 0 at the top of the image)
+    math::Vec4 tangent; // xyz + handedness in w; zero when the mesh has no tangent frame
 };
 
 // CPU-side mesh. Triangles are counter-clockwise when seen from outside.

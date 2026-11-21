@@ -28,9 +28,19 @@ struct FrameData {
 [[vk::binding(4, 0)]] Sampler2D<float4> bloom_tex;
 [[vk::binding(5, 0)]] Sampler2D<float> height_map; // top-down depth of the level
 [[vk::binding(6, 0)]] Sampler2D<float4> post_src;
+// Asset (glTF metallic-roughness) material textures.
+[[vk::binding(7, 0)]] Sampler2D<float4> base_color_tex;         // sRGB
+[[vk::binding(8, 0)]] Sampler2D<float4> metallic_roughness_tex; // G roughness, B metallic
+[[vk::binding(9, 0)]] Sampler2D<float4> normal_tex;             // tangent space
+[[vk::binding(10, 0)]] Sampler2D<float4> occlusion_tex;         // R
+[[vk::binding(11, 0)]] Sampler2D<float4> emissive_tex;          // sRGB
 
+// Must match ObjectPush in world_renderer.cpp. Procedural draws push only `model`.
 struct ObjectData {
     float4x4 model;
+    float4 base_color; // factor (linear rgba)
+    float4 material;   // x metallic, y roughness, z alpha cutoff (0 = opaque), w normal scale
+    float4 emissive;   // rgb factor, w occlusion strength
 };
 [[vk::push_constant]] ConstantBuffer<ObjectData> object;
 
@@ -190,6 +200,8 @@ struct VSInput {
     [[vk::location(0)]] float3 position;
     [[vk::location(1)]] float3 normal;
     [[vk::location(2)]] float4 color;
+    [[vk::location(3)]] float2 uv;
+    [[vk::location(4)]] float4 tangent;
 };
 
 [shader("vertex")]
@@ -201,6 +213,27 @@ float4 shadowVS(VSInput input) : SV_Position {
 [shader("fragment")]
 void shadowFS() {}
 
+// Asset shadow casters: alpha-tested foliage, fences etc. cut holes in the shadow.
+struct ShadowAssetOut {
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+[shader("vertex")]
+ShadowAssetOut shadowAssetVS(VSInput input) {
+    ShadowAssetOut o;
+    o.position = mul(frame.light_view_proj, mul(object.model, float4(input.position, 1.0)));
+    o.uv = input.uv;
+    return o;
+}
+
+[shader("fragment")]
+void shadowAssetFS(ShadowAssetOut input) {
+    if (object.material.z > 0.0 && base_color_tex.Sample(input.uv).a * object.base_color.a < object.material.z) {
+        discard;
+    }
+}
+
 // ------------------------------------------------------------------ main pass
 
 struct VSOutput {
@@ -208,6 +241,8 @@ struct VSOutput {
     float3 world_pos : POSITION0;
     float3 normal : NORMAL0;
     float4 color : COLOR0;
+    float2 uv : TEXCOORD0;
+    float4 tangent : TANGENT0;
 };
 
 [shader("vertex")]
@@ -226,6 +261,8 @@ VSOutput mainVS(VSInput input) {
     o.position = mul(frame.view_proj, world);
     o.normal = mul((float3x3)object.model, input.normal);
     o.color = input.color;
+    o.uv = input.uv;
+    o.tangent = float4(mul((float3x3)object.model, input.tangent.xyz), input.tangent.w);
     return o;
 }
 
