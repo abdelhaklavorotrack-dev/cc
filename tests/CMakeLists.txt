@@ -37,3 +37,11 @@ if(TARGET nova_village)
     set_tests_properties(village.headless_smoke PROPERTIES SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION
                          "Validation Error")
 endif()
+
+# Smoke test: the Guerrilla demo plays a scripted burst (fire, recoil, impacts) with validation on.
+if(TARGET nova_guerrilla)
+    add_test(NAME guerrilla.headless_smoke
+             COMMAND nova_guerrilla --headless --validation --frames 40 --fire --width 640 --height 360)
+    set_tests_properties(guerrilla.headless_smoke PROPERTIES SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION
+                         "Validation Error")
+endif()

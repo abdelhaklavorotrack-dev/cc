@@ -18,7 +18,10 @@ struct FrameData {
     float4 camera_clip;    // x near, y far, z contact-AO strength, w SSAO strength
     float4 height_params;  // x height-camera y, y its near plane, z depth range, w contact-AO radius
     float4 post_params;    // x bloom, y saturation, z colour bounce, w SSAO radius
-    float4 screen;         // xy = 1 / size, zw = size (pixels)
+    float4 screen;         // xy = 1 / size, zw = size (pixels) of the internal render targets
+    float4 point_light;    // xyz position, w range (m)
+    float4 point_color;    // rgb radiance (0 = off), w crosshair arm length (px, 0 = off)
+    float4 output_size;    // xy back-buffer pixels
 };
 
 [[vk::binding(0, 0)]] ConstantBuffer<FrameData> frame;
@@ -533,6 +536,16 @@ float3 light_surface(Surface s, int id, float3 p, float3 geom_n) {
         float fresnel = 0.02 + 0.98 * pow(1.0 - saturate(dot(n, v)), 5.0);
         color = lerp(color, sky_color(r) * lerp(0.35, 0.8, shadow), saturate(fresnel * 1.2 + 0.12));
     }
+    // Point light (muzzle flash): inverse-square with a smooth range cut-off, unshadowed.
+    if (any(frame.point_color.rgb > 0.0)) {
+        float3 lv = frame.point_light.xyz - p;
+        float d2 = dot(lv, lv);
+        float3 pl = lv * rsqrt(max(d2, 1e-6));
+        float window = saturate(1.0 - pow(d2 / (frame.point_light.w * frame.point_light.w), 2.0));
+        float3 radiance = frame.point_color.rgb * window * window / (d2 + 0.04);
+        float pndl = saturate(dot(n, pl));
+        color += (diffuse_albedo + ggx_specular(n, v, pl, s.roughness, f0)) * radiance * pndl;
+    }
     color += s.emissive;
     return apply_fog(color, p);
 }
@@ -650,14 +663,15 @@ float4 compositeFS(FullscreenOut input) : SV_Target {
     const float exposure = frame.camera_forward.w;
     float3 c = hdr_scene.SampleLevel(uv, 0.0).rgb;
     float d = scene_depth.SampleLevel(uv, 0.0);
-    if (d < 1.0 && frame.camera_clip.w > 0.0) {
-        float t = linear_depth(d);
-        c *= ssao(uv, screen_to_world(uv, t), t, input.position.xy);
+    // First-person viewmodel (< 0.6 m) is skipped: its scale is far below the SSAO radius.
+    float view_t = d < 1.0 ? linear_depth(d) : 1e6;
+    if (d < 1.0 && view_t > 0.6 && frame.camera_clip.w > 0.0) {
+        c *= ssao(uv, screen_to_world(uv, view_t), view_t, input.position.xy);
     }
 
     // Screen-space colour bleed: nearby lit surfaces tint the shadows (cheap one-bounce look).
     const float bounce = frame.post_params.z;
-    if (bounce > 0.0) {
+    if (bounce > 0.0 && view_t > 0.6) {
         float3 e = c * exposure;
         float l = dot(e, float3(0.2126, 0.7152, 0.0722));
         float sh = 1.0 - smoothstep(0.05, 0.7, l);
@@ -775,6 +789,21 @@ float4 postFS(FullscreenOut input) : SV_Target {
     c = lerp(float3(l, l, l), c, frame.post_params.y * (1.0 + 0.1 * (1.0 - k)));
     c *= lerp(float3(1.06, 0.97, 0.86), float3(1.03, 1.0, 0.95), k);
     c = saturate((c - 0.18) * 1.1 + 0.18);
+
+    // Crosshair: four arms around the centre with a dark outline.
+    const float arm = frame.point_color.w;
+    if (arm > 0.0) {
+        float2 q = abs(input.position.xy - frame.output_size.xy * 0.5);
+        const float gap = arm * 0.6;
+        float along = max(q.x, q.y);
+        float across = min(q.x, q.y);
+        bool in_arm = along >= gap && along <= gap + arm;
+        if (in_arm && across <= 1.0) {
+            c = lerp(c, float3(0.95, 0.95, 0.9), 0.85);
+        } else if (along >= gap - 1.0 && along <= gap + arm + 1.0 && across <= 2.0) {
+            c *= 0.35;
+        }
+    }
 
     // Triangular dither hides banding in the 8-bit output.
     float noise = hash13(float3(input.position.xy, 1.0)) - hash13(float3(input.position.yx, 2.0));
