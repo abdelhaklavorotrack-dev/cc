@@ -208,6 +208,9 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
 
 WorldRenderer::~WorldRenderer() {
     for (const GpuMesh& m : meshes_) {
+        for (rhi::BufferHandle b : m.dynamic) {
+            device_.destroy(b);
+        }
         device_.destroy(m.vertices);
         device_.destroy(m.indices);
     }
@@ -288,7 +291,7 @@ MaterialId WorldRenderer::add_material(const PbrMaterial& material) {
     return {static_cast<u32>(materials_.size())};
 }
 
-std::vector<WorldDrawItem> WorldRenderer::upload_model(const ModelData& model, const Mat4& placement) {
+std::vector<MaterialId> WorldRenderer::upload_materials(const ModelData& model) {
     // Each image is uploaded once per colour space it is used in.
     std::vector<rhi::TextureHandle> srgb(model.images.size()), linear(model.images.size());
     auto texture = [&](i32 index, bool is_srgb) -> rhi::TextureHandle {
@@ -302,7 +305,6 @@ std::vector<WorldDrawItem> WorldRenderer::upload_model(const ModelData& model, c
         return slot;
     };
     std::vector<MaterialId> materials;
-    std::vector<bool> double_sided;
     for (const MaterialData& src : model.materials) {
         PbrMaterial m;
         m.base_color = texture(src.base_color_image, true);
@@ -321,6 +323,42 @@ std::vector<WorldDrawItem> WorldRenderer::upload_model(const ModelData& model, c
                                                               : 0.0f;
         m.double_sided = src.double_sided;
         materials.push_back(add_material(m));
+    }
+    return materials;
+}
+
+MeshId WorldRenderer::upload_dynamic(const MeshData& mesh) {
+    const MeshId id = upload(mesh);
+    if (id.id == 0) {
+        return id;
+    }
+    GpuMesh& gpu = meshes_[id.id - 1];
+    const usize bytes = mesh.vertices.size() * sizeof(Vertex);
+    for (u32 i = 0; i < device_.frames_in_flight(); ++i) {
+        gpu.dynamic.push_back(device_.create_buffer({bytes, rhi::BufferUsage::Vertex, mesh.vertices.data()}));
+        gpu.slot_version.push_back(0);
+    }
+    gpu.pending = mesh.vertices;
+    return id;
+}
+
+void WorldRenderer::update_vertices(MeshId mesh, std::span<const Vertex> vertices) {
+    if (mesh.id == 0 || mesh.id > meshes_.size()) {
+        return;
+    }
+    GpuMesh& gpu = meshes_[mesh.id - 1];
+    if (gpu.dynamic.empty() || vertices.size() != gpu.pending.size()) {
+        NOVA_ERROR("Renderer", "update_vertices: mesh {} is not dynamic or the vertex count changed", mesh.id);
+        return;
+    }
+    std::copy(vertices.begin(), vertices.end(), gpu.pending.begin());
+    ++gpu.version;
+}
+
+std::vector<WorldDrawItem> WorldRenderer::upload_model(const ModelData& model, const Mat4& placement) {
+    const std::vector<MaterialId> materials = upload_materials(model);
+    std::vector<bool> double_sided;
+    for (const MaterialData& src : model.materials) {
         double_sided.push_back(src.double_sided);
     }
     MaterialId default_material;
@@ -438,6 +476,14 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
     const rhi::BufferHandle frame_buffer = frame_buffers_[frame_counter_ % frame_buffers_.size()];
     ++frame_counter_;
     device_.update_buffer(frame_buffer, &fd, sizeof(fd));
+    // Dynamic vertices: begin_frame() has also waited for this slot's previous use.
+    const usize slot = (frame_counter_ - 1) % frame_buffers_.size();
+    for (GpuMesh& m : meshes_) {
+        if (!m.dynamic.empty() && m.slot_version[slot] != m.version) {
+            device_.update_buffer(m.dynamic[slot], m.pending.data(), m.pending.size() * sizeof(Vertex));
+            m.slot_version[slot] = m.version;
+        }
+    }
     const rhi::ResourceBinding frame_res{0, frame_buffer, {}};
 
     stats_ = {};
@@ -460,7 +506,7 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
         } else {
             cmd->push_constants(&item.transform, sizeof(Mat4));
         }
-        cmd->bind_vertex_buffer(mesh.vertices);
+        cmd->bind_vertex_buffer(mesh.dynamic.empty() ? mesh.vertices : mesh.dynamic[slot]);
         cmd->bind_index_buffer(mesh.indices);
         cmd->draw_indexed(mesh.index_count);
         ++stats_.draw_calls;

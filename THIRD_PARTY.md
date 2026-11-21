@@ -12,3 +12,9 @@
 
 Pinned archives and SHA-256 hashes are in `cmake/NovaDependencies.cmake`. A `slangc` found on `PATH` or in
 `$VULKAN_SDK/bin` is used instead of the download. Policy: `docs/adr/0006-third-party-dependencies.md`.
+
+## Art assets
+
+| Asset | Author | License | Used by |
+|-------|--------|---------|---------|
+| [FPS AK-74m animations](https://sketchfab.com/3d-models/fps-ak-74m-animations-94be8385c402474cacd39bc096c6ca14) (`assets/viewmodels/fps_ak74m.glb`) | [Cransh](https://sketchfab.com/ccransh) | [CC BY 4.0](http://creativecommons.org/licenses/by/4.0/) | `nova_guerrilla` first-person arms + rifle (unmodified) |

@@ -45,6 +45,7 @@
 #pragma warning(pop)
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -270,7 +271,41 @@ std::optional<ModelData> load_gltf(const std::filesystem::path& path, std::strin
 
             ModelPrimitive out;
             out.transform = xf;
+            out.node = static_cast<i32>(ni);
             if (prim.material != nullptr) out.material = static_cast<i32>(prim.material - raw->materials);
+            if (node.skin != nullptr) out.skin = static_cast<i32>(node.skin - raw->skins);
+
+            const cgltf_accessor *joints = nullptr, *weights = nullptr;
+            for (std::size_t ai = 0; ai < prim.attributes_count; ++ai) {
+                const cgltf_attribute& a = prim.attributes[ai];
+                if (a.type == cgltf_attribute_type_joints && a.index == 0) joints = a.data;
+                else if (a.type == cgltf_attribute_type_weights && a.index == 0) weights = a.data;
+            }
+            if (out.skin >= 0 && joints != nullptr && weights != nullptr) {
+                const std::size_t joint_count = node.skin->joints_count;
+                out.joints.resize(pos->count);
+                out.weights.resize(pos->count);
+                for (std::size_t v = 0; v < pos->count; ++v) {
+                    cgltf_uint j[4] = {};
+                    f32 w[4] = {};
+                    if (v < joints->count) cgltf_accessor_read_uint(joints, v, j, 4);
+                    if (v < weights->count) cgltf_accessor_read_float(weights, v, w, 4);
+                    f32 sum = 0.0f;
+                    for (int k = 0; k < 4; ++k) {
+                        if (j[k] >= joint_count) w[k] = 0.0f; // invalid joint: drop the influence
+                        sum += w[k];
+                    }
+                    if (sum <= 0.0f) {
+                        w[0] = 1.0f;
+                        j[0] = 0;
+                        sum = 1.0f;
+                    }
+                    for (int k = 0; k < 4; ++k) out.joints[v][static_cast<std::size_t>(k)] = static_cast<u16>(j[k] < joint_count ? j[k] : 0);
+                    out.weights[v] = {w[0] / sum, w[1] / sum, w[2] / sum, w[3] / sum};
+                }
+            } else {
+                out.skin = -1;
+            }
 
             out.mesh.vertices.resize(pos->count);
             for (std::size_t v = 0; v < pos->count; ++v) {
@@ -332,7 +367,118 @@ std::optional<ModelData> load_gltf(const std::filesystem::path& path, std::strin
     }
     model.bounds_min = bmin;
     model.bounds_max = bmax;
+
+    // ---- scene graph (rest pose), skins and animations
+    model.nodes.resize(raw->nodes_count);
+    for (std::size_t ni = 0; ni < raw->nodes_count; ++ni) {
+        const cgltf_node& n = raw->nodes[ni];
+        NodeData& out = model.nodes[ni];
+        out.name = n.name != nullptr ? n.name : "";
+        out.parent = n.parent != nullptr ? static_cast<i32>(n.parent - raw->nodes) : -1;
+        if (n.has_matrix) {
+            Mat4 m;
+            for (int c = 0; c < 4; ++c)
+                for (int r = 0; r < 4; ++r) m.m[static_cast<std::size_t>(c)][static_cast<std::size_t>(r)] = n.matrix[c * 4 + r];
+            out.translation = {m.m[3][0], m.m[3][1], m.m[3][2]};
+            Vec3 cols[3];
+            for (int c = 0; c < 3; ++c) cols[c] = {m.m[static_cast<std::size_t>(c)][0], m.m[static_cast<std::size_t>(c)][1], m.m[static_cast<std::size_t>(c)][2]};
+            Vec3 s{math::length(cols[0]), math::length(cols[1]), math::length(cols[2])};
+            if (math::dot(cols[0], math::cross(cols[1], cols[2])) < 0.0f) s.x = -s.x; // mirrored: fold into one axis
+            Mat4 rot = Mat4::identity();
+            const f32 sv[3] = {s.x, s.y, s.z};
+            for (int c = 0; c < 3; ++c) {
+                const f32 inv = sv[c] != 0.0f ? 1.0f / sv[c] : 0.0f;
+                for (int r = 0; r < 3; ++r) rot.m[static_cast<std::size_t>(c)][static_cast<std::size_t>(r)] = m.m[static_cast<std::size_t>(c)][static_cast<std::size_t>(r)] * inv;
+            }
+            out.rotation = math::to_quat(rot);
+            out.scale = s;
+        } else {
+            if (n.has_translation) out.translation = {n.translation[0], n.translation[1], n.translation[2]};
+            if (n.has_rotation) out.rotation = math::normalize(math::Quat{n.rotation[0], n.rotation[1], n.rotation[2], n.rotation[3]});
+            if (n.has_scale) out.scale = {n.scale[0], n.scale[1], n.scale[2]};
+        }
+    }
+
+    model.skins.resize(raw->skins_count);
+    for (std::size_t si = 0; si < raw->skins_count; ++si) {
+        const cgltf_skin& s = raw->skins[si];
+        SkinData& out = model.skins[si];
+        out.name = s.name != nullptr ? s.name : "";
+        out.joints.resize(s.joints_count);
+        out.inverse_bind.assign(s.joints_count, Mat4::identity());
+        for (std::size_t k = 0; k < s.joints_count; ++k) {
+            out.joints[k] = static_cast<i32>(s.joints[k] - raw->nodes);
+            if (s.inverse_bind_matrices != nullptr && k < s.inverse_bind_matrices->count) {
+                f32 f[16] = {};
+                cgltf_accessor_read_float(s.inverse_bind_matrices, k, f, 16);
+                for (int c = 0; c < 4; ++c)
+                    for (int r = 0; r < 4; ++r) out.inverse_bind[k].m[static_cast<std::size_t>(c)][static_cast<std::size_t>(r)] = f[c * 4 + r];
+            }
+        }
+    }
+
+    model.animations.reserve(raw->animations_count);
+    for (std::size_t ai = 0; ai < raw->animations_count; ++ai) {
+        const cgltf_animation& a = raw->animations[ai];
+        AnimationData out;
+        out.name = a.name != nullptr ? a.name : ("animation_" + std::to_string(ai));
+        for (std::size_t ci = 0; ci < a.channels_count; ++ci) {
+            const cgltf_animation_channel& ch = a.channels[ci];
+            if (ch.target_node == nullptr || ch.sampler == nullptr || ch.sampler->input == nullptr || ch.sampler->output == nullptr) continue;
+            AnimChannel c;
+            c.node = static_cast<i32>(ch.target_node - raw->nodes);
+            int comps = 3;
+            switch (ch.target_path) {
+            case cgltf_animation_path_type_translation: c.path = AnimPath::Translation; break;
+            case cgltf_animation_path_type_rotation: c.path = AnimPath::Rotation; comps = 4; break;
+            case cgltf_animation_path_type_scale: c.path = AnimPath::Scale; break;
+            default: continue; // morph weights are not supported
+            }
+            switch (ch.sampler->interpolation) {
+            case cgltf_interpolation_type_step: c.interpolation = AnimInterpolation::Step; break;
+            case cgltf_interpolation_type_cubic_spline: c.interpolation = AnimInterpolation::CubicSpline; break;
+            default: c.interpolation = AnimInterpolation::Linear; break;
+            }
+            const cgltf_accessor* in = ch.sampler->input;
+            const cgltf_accessor* outv = ch.sampler->output;
+            c.times.resize(in->count);
+            for (std::size_t k = 0; k < in->count; ++k) cgltf_accessor_read_float(in, k, &c.times[k], 1);
+            const std::size_t per_key = c.interpolation == AnimInterpolation::CubicSpline ? 3 : 1;
+            if (c.times.empty() || outv->count < c.times.size() * per_key) continue;
+            c.values.resize(c.times.size() * per_key);
+            for (std::size_t k = 0; k < c.values.size(); ++k) {
+                f32 f[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                cgltf_accessor_read_float(outv, k, f, static_cast<cgltf_size>(comps));
+                c.values[k] = {f[0], f[1], f[2], f[3]};
+            }
+            out.duration = std::max(out.duration, c.times.back());
+            out.channels.push_back(std::move(c));
+        }
+        model.animations.push_back(std::move(out));
+    }
     return model;
+}
+
+i32 ModelData::find_node(std::string_view name) const noexcept {
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+        if (nodes[i].name == name) return static_cast<i32>(i);
+    }
+    return -1;
+}
+
+i32 ModelData::find_animation(std::string_view name) const noexcept {
+    for (std::size_t i = 0; i < animations.size(); ++i) {
+        if (animations[i].name == name) return static_cast<i32>(i);
+    }
+    // Exporters prefix clip names ("Rig|AK_Idle", "Armature|Walk"): accept a "|name" suffix.
+    for (std::size_t i = 0; i < animations.size(); ++i) {
+        const std::string& n = animations[i].name;
+        if (n.size() > name.size() && n.compare(n.size() - name.size(), name.size(), name) == 0 &&
+            n[n.size() - name.size() - 1] == '|') {
+            return static_cast<i32>(i);
+        }
+    }
+    return -1;
 }
 
 } // namespace nova::renderer

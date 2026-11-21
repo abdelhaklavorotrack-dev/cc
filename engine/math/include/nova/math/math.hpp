@@ -176,4 +176,122 @@ struct Mat4 {
 [[nodiscard]] constexpr f32 lerp(f32 a, f32 b, f32 t) noexcept { return a + (b - a) * t; }
 [[nodiscard]] constexpr Vec3 lerp(const Vec3& a, const Vec3& b, f32 t) noexcept { return a + (b - a) * t; }
 
+// Unit quaternion (x, y, z, w), glTF convention; identity = (0, 0, 0, 1).
+struct Quat {
+    f32 x = 0, y = 0, z = 0, w = 1;
+    constexpr bool operator==(const Quat&) const noexcept = default;
+};
+
+[[nodiscard]] inline Quat normalize(const Quat& q) noexcept {
+    const f32 len = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    return len > 0.0f ? Quat{q.x / len, q.y / len, q.z / len, q.w / len} : Quat{};
+}
+
+[[nodiscard]] constexpr Quat operator*(const Quat& a, const Quat& b) noexcept {
+    return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+
+[[nodiscard]] inline Quat axis_angle(const Vec3& axis, f32 angle) noexcept {
+    const Vec3 a = normalize(axis);
+    const f32 s = std::sin(angle * 0.5f);
+    return {a.x * s, a.y * s, a.z * s, std::cos(angle * 0.5f)};
+}
+
+// Normalized lerp along the shorter arc; accurate enough for animation blending.
+[[nodiscard]] inline Quat nlerp(const Quat& a, Quat b, f32 t) noexcept {
+    if (a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w < 0.0f) {
+        b = {-b.x, -b.y, -b.z, -b.w};
+    }
+    return normalize(Quat{a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, a.w + (b.w - a.w) * t});
+}
+
+[[nodiscard]] inline Quat slerp(const Quat& a, Quat b, f32 t) noexcept {
+    f32 d = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    if (d < 0.0f) {
+        b = {-b.x, -b.y, -b.z, -b.w};
+        d = -d;
+    }
+    if (d > 0.9995f) {
+        return nlerp(a, b, t);
+    }
+    const f32 theta = std::acos(d);
+    const f32 sa = std::sin((1.0f - t) * theta) / std::sin(theta), sb = std::sin(t * theta) / std::sin(theta);
+    return {a.x * sa + b.x * sb, a.y * sa + b.y * sb, a.z * sa + b.z * sb, a.w * sa + b.w * sb};
+}
+
+[[nodiscard]] inline Mat4 to_mat4(const Quat& q) noexcept {
+    const f32 x = q.x, y = q.y, z = q.z, w = q.w;
+    Mat4 r = Mat4::identity();
+    r.m[0][0] = 1 - 2 * (y * y + z * z);
+    r.m[0][1] = 2 * (x * y + z * w);
+    r.m[0][2] = 2 * (x * z - y * w);
+    r.m[1][0] = 2 * (x * y - z * w);
+    r.m[1][1] = 1 - 2 * (x * x + z * z);
+    r.m[1][2] = 2 * (y * z + x * w);
+    r.m[2][0] = 2 * (x * z + y * w);
+    r.m[2][1] = 2 * (y * z - x * w);
+    r.m[2][2] = 1 - 2 * (x * x + y * y);
+    return r;
+}
+
+// Rotation of an orthonormal, right-handed basis given as matrix columns (scale must be removed).
+[[nodiscard]] inline Quat to_quat(const Mat4& m) noexcept {
+    const f32 m00 = m.m[0][0], m11 = m.m[1][1], m22 = m.m[2][2];
+    const f32 trace = m00 + m11 + m22;
+    Quat q;
+    if (trace > 0.0f) {
+        const f32 s = std::sqrt(trace + 1.0f) * 2.0f;
+        q = {(m.m[1][2] - m.m[2][1]) / s, (m.m[2][0] - m.m[0][2]) / s, (m.m[0][1] - m.m[1][0]) / s, 0.25f * s};
+    } else if (m00 > m11 && m00 > m22) {
+        const f32 s = std::sqrt(1.0f + m00 - m11 - m22) * 2.0f;
+        q = {0.25f * s, (m.m[1][0] + m.m[0][1]) / s, (m.m[2][0] + m.m[0][2]) / s, (m.m[1][2] - m.m[2][1]) / s};
+    } else if (m11 > m22) {
+        const f32 s = std::sqrt(1.0f + m11 - m00 - m22) * 2.0f;
+        q = {(m.m[1][0] + m.m[0][1]) / s, 0.25f * s, (m.m[2][1] + m.m[1][2]) / s, (m.m[2][0] - m.m[0][2]) / s};
+    } else {
+        const f32 s = std::sqrt(1.0f + m22 - m00 - m11) * 2.0f;
+        q = {(m.m[2][0] + m.m[0][2]) / s, (m.m[2][1] + m.m[1][2]) / s, 0.25f * s, (m.m[0][1] - m.m[1][0]) / s};
+    }
+    return normalize(q);
+}
+
+// translate(t) * rotate(r) * scale(s), the glTF node transform.
+[[nodiscard]] inline Mat4 compose(const Vec3& t, const Quat& r, const Vec3& s) noexcept {
+    Mat4 m = to_mat4(r);
+    for (int row = 0; row < 3; ++row) {
+        m.m[0][row] *= s.x;
+        m.m[1][row] *= s.y;
+        m.m[2][row] *= s.z;
+    }
+    m.m[3][0] = t.x;
+    m.m[3][1] = t.y;
+    m.m[3][2] = t.z;
+    return m;
+}
+
+// Inverse of an affine matrix (last row 0 0 0 1); returns identity if singular.
+[[nodiscard]] inline Mat4 inverse_affine(const Mat4& m) noexcept {
+    const Vec3 c0{m.m[0][0], m.m[0][1], m.m[0][2]};
+    const Vec3 c1{m.m[1][0], m.m[1][1], m.m[1][2]};
+    const Vec3 c2{m.m[2][0], m.m[2][1], m.m[2][2]};
+    const Vec3 t{m.m[3][0], m.m[3][1], m.m[3][2]};
+    // Rows of the inverse 3x3 are the cofactor columns divided by the determinant.
+    const Vec3 r0 = cross(c1, c2), r1 = cross(c2, c0), r2 = cross(c0, c1);
+    const f32 det = dot(c0, r0);
+    if (std::abs(det) < 1e-20f) {
+        return Mat4::identity();
+    }
+    const f32 inv = 1.0f / det;
+    Mat4 r = Mat4::identity();
+    const Vec3 rows[3] = {r0 * inv, r1 * inv, r2 * inv};
+    for (int row = 0; row < 3; ++row) {
+        r.m[0][row] = rows[row].x;
+        r.m[1][row] = rows[row].y;
+        r.m[2][row] = rows[row].z;
+        r.m[3][row] = -dot(rows[row], t);
+    }
+    return r;
+}
+
 } // namespace nova::math

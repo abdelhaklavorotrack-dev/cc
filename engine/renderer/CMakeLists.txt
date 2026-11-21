@@ -3,6 +3,7 @@ nova_add_module(renderer
         src/mesh.cpp
         src/renderer.cpp
         src/world_renderer.cpp
+        src/animation.cpp
         src/gltf_loader.cpp
     PUBLIC_DEPS
         Nova::math

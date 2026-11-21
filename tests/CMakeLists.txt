@@ -7,7 +7,8 @@ add_executable(nova_tests
 target_link_libraries(nova_tests PRIVATE
     Nova::core Nova::memory Nova::jobs Nova::platform Nova::math doctest::doctest)
 if(NOVA_WITH_VULKAN)
-    target_sources(nova_tests PRIVATE math_tests.cpp model_tests.cpp)
+    target_sources(nova_tests PRIVATE math_tests.cpp model_tests.cpp animation_tests.cpp)
+    target_compile_definitions(nova_tests PRIVATE NOVA_TEST_ASSET_DIR="${PROJECT_SOURCE_DIR}/assets")
     target_link_libraries(nova_tests PRIVATE Nova::renderer nova_stb)
 endif()
 nova_set_warnings(nova_tests)

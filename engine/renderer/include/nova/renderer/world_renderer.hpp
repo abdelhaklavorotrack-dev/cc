@@ -112,6 +112,12 @@ public:
 
     [[nodiscard]] bool valid() const noexcept { return valid_; }
     [[nodiscard]] MeshId upload(const MeshData& mesh);
+    // Mesh whose vertices change every frame (skinned characters, viewmodels). Indices are fixed;
+    // update_vertices() must pass the same vertex count and takes effect from the next frame.
+    [[nodiscard]] MeshId upload_dynamic(const MeshData& mesh);
+    void update_vertices(MeshId mesh, std::span<const Vertex> vertices);
+    // Textures + materials of `model`, one MaterialId per ModelData::materials entry.
+    [[nodiscard]] std::vector<MaterialId> upload_materials(const ModelData& model);
     // Asset resources are owned by the renderer and live until it is destroyed.
     [[nodiscard]] rhi::TextureHandle upload_texture(const ImageData& image, bool srgb);
     [[nodiscard]] MaterialId add_material(const PbrMaterial& material);
@@ -131,6 +137,11 @@ private:
         rhi::BufferHandle vertices;
         rhi::BufferHandle indices;
         u32 index_count = 0;
+        // Dynamic meshes: one vertex buffer per frame in flight, refreshed from `pending`.
+        std::vector<rhi::BufferHandle> dynamic;
+        std::vector<u64> slot_version;
+        std::vector<Vertex> pending;
+        u64 version = 0;
     };
 
     bool ensure_targets(rhi::Extent extent);

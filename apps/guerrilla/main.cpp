@@ -3,7 +3,8 @@
 // colour bleed, bloom, FXAA) plus the PBR asset path for the hands and rifle.
 //
 //   nova_guerrilla [--quality ultra|high|medium|low] [--render-scale S] [--width W --height H] [--no-vsync]
-//                  [--validation] [--headless --frames N --screenshot out.ppm [--ads] [--fire]]
+//                  [--viewmodel file.glb | --procedural-viewmodel] [--validation]
+//                  [--headless --frames N --screenshot out.ppm [--ads] [--fire] [--reload]]
 //
 // Controls: mouse look, WASD move, Shift sprint, Space jump, LMB fire (full auto), RMB aim down
 // sights, R reload, Esc quit. Exit code 77 means no usable Vulkan device.
@@ -14,6 +15,7 @@
 #include "nova/renderer/world_renderer.hpp"
 #include "nova/rhi/rhi.hpp"
 
+#include "rig_viewmodel.hpp"
 #include "viewmodel.hpp"
 #include "village_scene.hpp"
 
@@ -23,6 +25,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <memory>
 #include <format>
 #include <optional>
 #include <string>
@@ -164,7 +168,7 @@ bool ray_terrain(const Vec3& o, const Vec3& d, f32 max_t, f32& t_out) {
 
 Vec3 terrain_normal(f32 x, f32 z) {
     constexpr f32 e = 0.1f;
-    return math::normalize({village::terrain_height(x - e, z) - village::terrain_height(x + e, z), 2.0f * e,
+    return math::normalize(Vec3{village::terrain_height(x - e, z) - village::terrain_height(x + e, z), 2.0f * e,
                             village::terrain_height(x, z - e) - village::terrain_height(x, z + e)});
 }
 
@@ -265,9 +269,12 @@ int main(int argc, char** argv) {
     u64 max_frames = 0;
     std::string screenshot;
     std::string quality_name = "ultra";
+    std::string viewmodel_path;
+    bool procedural_viewmodel = false;
     f32 render_scale_override = 0.0f;
     bool script_ads = false;
     bool script_fire = false;
+    bool script_reload = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
         const bool has_value = i + 1 < argc;
@@ -285,12 +292,18 @@ int main(int argc, char** argv) {
             ddesc.validation = true;
         } else if (arg == "--render-scale" && has_value) {
             parse_number(argv[++i], render_scale_override);
+        } else if (arg == "--viewmodel" && has_value) {
+            viewmodel_path = argv[++i];
+        } else if (arg == "--procedural-viewmodel") {
+            procedural_viewmodel = true;
         } else if (arg == "--quality" && has_value) {
             quality_name = argv[++i];
         } else if (arg == "--screenshot" && has_value) {
             screenshot = argv[++i];
         } else if (arg == "--ads") {
             script_ads = true;
+        } else if (arg == "--reload") {
+            script_reload = true;
         } else if (arg == "--fire") {
             script_fire = true;
         }
@@ -420,6 +433,32 @@ int main(int argc, char** argv) {
     const std::vector<VmPart> vm_right = upload_pieces(vm.right_hand);
     const std::vector<VmPart> vm_left = upload_pieces(vm.left_hand);
     const std::vector<VmPart> vm_flash = upload_pieces(vm.flash);
+
+    // Animated arms + AK-74M rig (glTF); the procedural rifle stays as a fallback.
+    std::unique_ptr<guerrilla::RigViewmodel> rig;
+    if (!procedural_viewmodel) {
+        if (viewmodel_path.empty()) {
+            for (const std::filesystem::path& p :
+                 {std::filesystem::path("assets/viewmodels/fps_ak74m.glb"),
+                  std::filesystem::path(NOVA_GUERRILLA_ASSET_DIR) / "viewmodels/fps_ak74m.glb"}) {
+                if (std::filesystem::exists(p)) {
+                    viewmodel_path = p.string();
+                    break;
+                }
+            }
+        }
+        if (!viewmodel_path.empty()) {
+            std::string error;
+            rig = guerrilla::RigViewmodel::load(viewmodel_path, world, &error);
+            if (rig) {
+                NOVA_INFO("Guerrilla", "viewmodel {}: {} triangles, skinned + animated", viewmodel_path,
+                          rig->triangle_count());
+            } else {
+                NOVA_WARN("Guerrilla", "could not use viewmodel {} ({}); using the procedural rifle", viewmodel_path,
+                          error);
+            }
+        }
+    }
     NOVA_INFO("Guerrilla", "level + viewmodel ready in {:.0f} ms | quality {} (render scale {:.2f}, shadows {})",
               build_timer.elapsed_ms(), quality_name, quality->render_scale, quality->shadow_map);
 
@@ -440,7 +479,7 @@ int main(int argc, char** argv) {
     // ---- weapon state
     constexpr int kMagSize = 30;
     constexpr f32 kFireInterval = 60.0f / 600.0f; // 600 rounds per minute
-    constexpr f32 kReloadTime = 2.3f;
+    f32 reload_duration = 2.3f; // procedural viewmodel; the rig uses its reload clip lengths
     int ammo = kMagSize;
     f32 fire_cooldown = 0.0f;
     f32 reload_timer = -1.0f; // < 0: not reloading
@@ -603,13 +642,20 @@ int main(int argc, char** argv) {
         camera.fov_y = math::radians(math::lerp(68.0f, 52.0f, ads));
         fire_cooldown -= dt;
         flash_timer -= dt;
-        if ((input.was_pressed(platform::Key::R) && ammo < kMagSize && reload_timer < 0.0f) ||
+        const bool reload_pressed = input.was_pressed(platform::Key::R) || (script_reload && frame + 50 == max_frames);
+        if (script_reload && frame + 51 == max_frames) {
+            ammo = 0; // scripted: show the full (empty-magazine) reload
+        }
+        if ((reload_pressed && ammo < kMagSize && reload_timer < 0.0f) ||
             (fire_held && ammo == 0 && reload_timer < 0.0f && fire_cooldown <= 0.0f)) {
             reload_timer = 0.0f;
+            if (rig) {
+                reload_duration = rig->start_reload(ammo == 0);
+            }
         }
         if (reload_timer >= 0.0f) {
             reload_timer += dt;
-            if (reload_timer >= kReloadTime) {
+            if (reload_timer >= reload_duration) {
                 reload_timer = -1.0f;
                 ammo = kMagSize;
             }
@@ -622,6 +668,9 @@ int main(int argc, char** argv) {
             ++shots_fired;
             flash_timer = 0.045f;
             flash_roll = rng.range(0.0f, math::kPi * 2.0f);
+            if (rig) {
+                rig->fire();
+            }
             kick = std::min(kick + 1.0f, 2.5f);
             const f32 climb = math::radians(rng.range(0.55f, 0.85f)) * (1.0f - 0.35f * ads);
             pitch = std::min(pitch + climb, 1.45f);
@@ -767,7 +816,7 @@ int main(int argc, char** argv) {
         // Reload: tilt the rifle, drop the magazine, seat a new one.
         f32 reload_tilt = 0.0f, mag_drop = 0.0f;
         if (reload_timer >= 0.0f) {
-            const f32 r = reload_timer / kReloadTime;
+            const f32 r = reload_timer / reload_duration;
             reload_tilt = smooth01(r / 0.15f) * (1.0f - smooth01((r - 0.85f) / 0.15f));
             mag_drop = r < 0.5f ? smooth01((r - 0.15f) / 0.2f) : 1.0f - smooth01((r - 0.55f) / 0.25f);
         }
@@ -789,15 +838,38 @@ int main(int argc, char** argv) {
                 items.push_back(it);
             }
         };
-        push_parts(vm_weapon, gun);
-        push_parts(vm_mag, mag);
-        push_parts(vm_right, gun);
-        push_parts(vm_left, left);
-        if (flash_timer > 0.0f) {
-            push_parts(vm_flash, gun * math::translate(vm.muzzle) * math::rotate({0, 0, 1}, flash_roll) *
-                                     math::scale({1.0f, 1.0f, rng.range(0.8f, 1.25f)}) *
-                                     math::translate(-vm.muzzle));
-            settings.point_light_position = math::transform_point(gun, vm.muzzle + Vec3{0, 0.05f, 0});
+        bool flash_on = flash_timer > 0.0f;
+        if (rig) {
+            rig->update({dt, move_speed, grounded, sprint, ads});
+            // Same shrink-about-the-eye trick: rig units -> 0.4 m scale keeps the barrel out of walls.
+            constexpr f32 kRigScale = 0.4f;
+            const Mat4 view_to_world = cam_world * math::scale({kRigScale, kRigScale, kRigScale}) *
+                                       // Hip: a little lower-right than authored, so the receiver does not fill the view.
+                                       math::translate(Vec3{0.05f, -0.055f, 0.03f} * (1.0f - smooth01(ads)) +
+                                                       Vec3{0.0f, 0.0f, kick * 0.02f * ads}) *
+                                       math::rotate({0, 1, 0}, sway.x) * math::rotate({1, 0, 0}, sway.y);
+            rig->push_items(items, view_to_world);
+            if (flash_on) {
+                push_parts(vm_flash, view_to_world * rig->flash_to_view(ads, vm.muzzle) *
+                                         math::translate(vm.muzzle) * math::rotate({0, 0, 1}, flash_roll) *
+                                         math::scale({1.0f, 1.0f, rng.range(0.8f, 1.25f)}) *
+                                         math::translate(-vm.muzzle));
+                settings.point_light_position =
+                    math::transform_point(view_to_world, rig->muzzle_view(ads) + Vec3{0, 0.08f, 0});
+            }
+        } else {
+            push_parts(vm_weapon, gun);
+            push_parts(vm_mag, mag);
+            push_parts(vm_right, gun);
+            push_parts(vm_left, left);
+            if (flash_on) {
+                push_parts(vm_flash, gun * math::translate(vm.muzzle) * math::rotate({0, 0, 1}, flash_roll) *
+                                         math::scale({1.0f, 1.0f, rng.range(0.8f, 1.25f)}) *
+                                         math::translate(-vm.muzzle));
+                settings.point_light_position = math::transform_point(gun, vm.muzzle + Vec3{0, 0.05f, 0});
+            }
+        }
+        if (flash_on) {
             settings.point_light_color = Vec3{12.0f, 6.5f, 2.4f} * rng.range(0.8f, 1.2f);
         } else {
             settings.point_light_color = {0, 0, 0};
