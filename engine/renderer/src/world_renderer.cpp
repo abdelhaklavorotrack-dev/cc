@@ -47,9 +47,19 @@ void set4(f32 (&dst)[4], const Vec3& v, f32 w) {
 enum ShaderSlot {
     kSkyVS, kSkyFS, kShadowVS, kShadowFS, kMainVS, kMainFS,
     kPostVS, kPostFS, kCompositeFS, kBloomDownFS, kBloomBlurHFS, kBloomBlurVFS,
+    kShadowAssetVS, kShadowAssetFS, kAssetFS,
     kShaderCount
 };
 constexpr u32 kHeightMapSize = 1024;
+
+// Must match ObjectData in world.slang.
+struct ObjectPush {
+    Mat4 model;
+    f32 base_color[4];
+    f32 material[4]; // metallic, roughness, alpha cutoff, normal scale
+    f32 emissive[4]; // rgb, occlusion strength
+};
+static_assert(sizeof(ObjectPush) == 112);
 
 constexpr rhi::Format kHdrFormat = rhi::Format::RGBA16_Float;
 
@@ -68,6 +78,8 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
         {"postVS", rhi::ShaderStage::Vertex},   {"postFS", rhi::ShaderStage::Fragment},
         {"compositeFS", rhi::ShaderStage::Fragment}, {"bloomDownFS", rhi::ShaderStage::Fragment},
         {"bloomBlurHFS", rhi::ShaderStage::Fragment}, {"bloomBlurVFS", rhi::ShaderStage::Fragment},
+        {"shadowAssetVS", rhi::ShaderStage::Vertex}, {"shadowAssetFS", rhi::ShaderStage::Fragment},
+        {"assetFS", rhi::ShaderStage::Fragment},
     };
     for (int i = 0; i < kShaderCount; ++i) {
         shaders_[i] = device_.create_shader({world_spv, entries[i].name, entries[i].stage});
@@ -82,6 +94,8 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
         {0, rhi::VertexFormat::Float3, static_cast<u32>(offsetof(Vertex, position))},
         {1, rhi::VertexFormat::Float3, static_cast<u32>(offsetof(Vertex, normal))},
         {2, rhi::VertexFormat::Float4, static_cast<u32>(offsetof(Vertex, color))},
+        {3, rhi::VertexFormat::Float2, static_cast<u32>(offsetof(Vertex, uv))},
+        {4, rhi::VertexFormat::Float4, static_cast<u32>(offsetof(Vertex, tangent))},
     };
 
     rhi::GraphicsPipelineDesc shadow;
@@ -89,7 +103,7 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
     shadow.fragment_shader = shaders_[kShadowFS];
     shadow.vertex_stride = sizeof(Vertex);
     shadow.attributes = attributes;
-    shadow.push_constant_size = sizeof(Mat4);
+    shadow.push_constant_size = sizeof(ObjectPush);
     shadow.bindings = {frame_binding};
     shadow.cull = rhi::CullMode::None; // thin walls and foliage must cast from both sides
     shadow.depth_bias = true;
@@ -110,7 +124,7 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
     main.fragment_shader = shaders_[kMainFS];
     main.vertex_stride = sizeof(Vertex);
     main.attributes = attributes;
-    main.push_constant_size = sizeof(Mat4);
+    main.push_constant_size = sizeof(ObjectPush);
     main.bindings = {frame_binding,
                      {1, rhi::BindingType::SampledTexture, rhi::Filter::Nearest},
                      {5, rhi::BindingType::SampledTexture, rhi::Filter::Nearest}};
@@ -118,6 +132,30 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
     main_pipeline_ = device_.create_graphics_pipeline(main);
     main.cull = rhi::CullMode::None;
     main_two_sided_pipeline_ = device_.create_graphics_pipeline(main);
+
+    using BT = rhi::BindingType;
+    rhi::GraphicsPipelineDesc asset = main;
+    asset.fragment_shader = shaders_[kAssetFS];
+    for (u32 b = 7; b <= 11; ++b) {
+        asset.bindings.push_back({b, BT::SampledTexture, rhi::Filter::Material});
+    }
+    asset.cull = rhi::CullMode::Back;
+    asset_pipeline_ = device_.create_graphics_pipeline(asset);
+    asset.cull = rhi::CullMode::None;
+    asset_two_sided_pipeline_ = device_.create_graphics_pipeline(asset);
+
+    rhi::GraphicsPipelineDesc asset_shadow = shadow;
+    asset_shadow.vertex_shader = shaders_[kShadowAssetVS];
+    asset_shadow.fragment_shader = shaders_[kShadowAssetFS];
+    asset_shadow.bindings = {frame_binding, {7, BT::SampledTexture, rhi::Filter::Material}};
+    asset_shadow_pipeline_ = device_.create_graphics_pipeline(asset_shadow);
+
+    // 1x1 fallbacks for materials without a given texture.
+    const u8 white[4] = {255, 255, 255, 255};
+    const u8 flat[4] = {128, 128, 255, 255};
+    white_srgb_ = device_.create_texture({1, 1, rhi::Format::RGBA8_sRGB, false, true, white});
+    white_linear_ = device_.create_texture({1, 1, rhi::Format::RGBA8_Unorm, false, true, white});
+    flat_normal_ = device_.create_texture({1, 1, rhi::Format::RGBA8_Unorm, false, true, flat});
 
     auto fullscreen = [&](ShaderSlot fs, std::vector<rhi::BindingDesc> bindings, rhi::Format color) {
         rhi::GraphicsPipelineDesc desc;
@@ -130,7 +168,6 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
         desc.color_format = color;
         return device_.create_graphics_pipeline(desc);
     };
-    using BT = rhi::BindingType;
     composite_pipeline_ = fullscreen(kCompositeFS,
                                      {frame_binding,
                                       {2, BT::SampledTexture, rhi::Filter::Linear},
@@ -154,7 +191,9 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
     height_frame_buffer_ = device_.create_buffer({sizeof(FrameData), rhi::BufferUsage::Uniform, nullptr});
 
     valid_ = shadow_pipeline_.valid() && sky_pipeline_.valid() && main_pipeline_.valid() &&
-             main_two_sided_pipeline_.valid() && composite_pipeline_.valid() && bloom_down_pipeline_.valid() &&
+             main_two_sided_pipeline_.valid() && asset_pipeline_.valid() && asset_two_sided_pipeline_.valid() &&
+             asset_shadow_pipeline_.valid() && white_srgb_.valid() && white_linear_.valid() && flat_normal_.valid() &&
+             composite_pipeline_.valid() && bloom_down_pipeline_.valid() &&
              bloom_blur_h_pipeline_.valid() && bloom_blur_v_pipeline_.valid() && post_pipeline_.valid() &&
              shadow_map_.valid() && height_map_.valid() && height_frame_buffer_.valid() &&
              std::ranges::all_of(frame_buffers_, [](rhi::BufferHandle b) { return b.valid(); });
@@ -172,10 +211,15 @@ WorldRenderer::~WorldRenderer() {
         device_.destroy(b);
     }
     device_.destroy(height_frame_buffer_);
-    for (rhi::TextureHandle t : {hdr_target_, scene_depth_, lit_target_, bloom_a_, bloom_b_, shadow_map_, height_map_}) {
+    for (rhi::TextureHandle t : owned_textures_) {
+        device_.destroy(t);
+    }
+    for (rhi::TextureHandle t : {hdr_target_, scene_depth_, lit_target_, bloom_a_, bloom_b_, shadow_map_, height_map_,
+                                 white_srgb_, white_linear_, flat_normal_}) {
         device_.destroy(t);
     }
     for (rhi::PipelineHandle p : {shadow_pipeline_, sky_pipeline_, main_pipeline_, main_two_sided_pipeline_,
+                                  asset_pipeline_, asset_two_sided_pipeline_, asset_shadow_pipeline_,
                                   composite_pipeline_, bloom_down_pipeline_, bloom_blur_h_pipeline_,
                                   bloom_blur_v_pipeline_, post_pipeline_}) {
         device_.destroy(p);

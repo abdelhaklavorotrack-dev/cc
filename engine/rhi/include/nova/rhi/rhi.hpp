@@ -37,12 +37,15 @@ enum class Format : u8 {
     Undefined,  // "no attachment" in pipeline descriptions
     BackBuffer, // whatever format the swapchain / offscreen back buffer uses
     RGBA8_sRGB,
+    RGBA8_Unorm,
     RGBA16_Float,
     D32_Float,
 };
 
 enum class CompareOp : u8 { Less, LessOrEqual, Always };
-enum class Filter : u8 { Linear, Nearest }; // clamp-to-edge addressing
+// Linear/Nearest: clamp-to-edge, no mip filtering (render targets).
+// Material: trilinear + anisotropic, repeat addressing (asset textures).
+enum class Filter : u8 { Linear, Nearest, Material };
 
 struct TextureDesc {
     u32 width = 0;
@@ -50,6 +53,10 @@ struct TextureDesc {
     Format format = Format::RGBA8_sRGB;
     bool render_target = true; // usable as a colour or depth attachment
     bool sampled = true;       // readable from shaders after the pass that wrote it
+    // Optional tightly packed RGBA8 pixels (RGBA8 formats only, render_target must be false). The
+    // texture is shader-readable immediately; with `mipmaps` the full chain is generated on the GPU.
+    const void* initial_data = nullptr;
+    bool mipmaps = false;
 };
 
 enum class BindingType : u8 { UniformBuffer, SampledTexture };

@@ -2,6 +2,7 @@
 
 #include "nova/math/math.hpp"
 #include "nova/renderer/mesh.hpp"
+#include "nova/renderer/model.hpp"
 #include "nova/renderer/renderer.hpp"
 #include "nova/rhi/rhi.hpp"
 
@@ -57,11 +58,35 @@ struct WorldSettings {
     f32 saturation = 1.06f;
 };
 
+// glTF-style metallic-roughness material for imported assets. Invalid textures fall back to
+// neutral defaults (white / flat normal), so factors alone also work.
+struct PbrMaterial {
+    rhi::TextureHandle base_color;         // sRGB
+    rhi::TextureHandle metallic_roughness; // linear: G roughness, B metallic
+    rhi::TextureHandle normal;             // linear, tangent space
+    rhi::TextureHandle occlusion;          // linear: R
+    rhi::TextureHandle emissive;           // sRGB
+    math::Vec4 base_color_factor{1.0f, 1.0f, 1.0f, 1.0f};
+    f32 metallic = 1.0f;
+    f32 roughness = 1.0f;
+    math::Vec3 emissive_factor{0.0f, 0.0f, 0.0f};
+    f32 normal_scale = 1.0f;
+    f32 occlusion_strength = 1.0f;
+    f32 alpha_cutoff = 0.0f; // > 0 enables alpha testing (glTF MASK; BLEND is approximated by 0.5)
+    bool double_sided = false;
+};
+
+struct MaterialId {
+    u32 id = 0; // 0 = procedural (Vertex::color.a material ids)
+    [[nodiscard]] constexpr bool valid() const noexcept { return id != 0; }
+};
+
 struct WorldDrawItem {
     MeshId mesh;
     math::Mat4 transform = math::Mat4::identity();
-    bool two_sided = false; // foliage, grass, flags
+    bool two_sided = false; // foliage, grass, flags (asset materials use PbrMaterial::double_sided)
     bool casts_shadow = true;
+    MaterialId material;    // valid => textured PBR asset shading
 };
 
 struct WorldRenderStats {
@@ -80,6 +105,14 @@ public:
 
     [[nodiscard]] bool valid() const noexcept { return valid_; }
     [[nodiscard]] MeshId upload(const MeshData& mesh);
+    // Asset resources are owned by the renderer and live until it is destroyed.
+    [[nodiscard]] rhi::TextureHandle upload_texture(const ImageData& image, bool srgb);
+    [[nodiscard]] MaterialId add_material(const PbrMaterial& material);
+    // Uploads every image, material and primitive of `model` and returns ready-to-draw items
+    // (transform = placement * node transform). Call before the first render_frame so the
+    // contact-AO height map includes the model, or call invalidate_contact_ao() afterwards.
+    [[nodiscard]] std::vector<WorldDrawItem> upload_model(const ModelData& model,
+                                                          const math::Mat4& placement = math::Mat4::identity());
 
     bool render_frame(const Camera& camera, const WorldSettings& settings, std::span<const WorldDrawItem> items);
     [[nodiscard]] const WorldRenderStats& stats() const noexcept { return stats_; }
@@ -99,11 +132,14 @@ private:
     u32 shadow_size_;
     bool valid_ = false;
     bool height_dirty_ = true;
-    rhi::ShaderHandle shaders_[12]{};
+    rhi::ShaderHandle shaders_[15]{};
     rhi::PipelineHandle shadow_pipeline_;
     rhi::PipelineHandle sky_pipeline_;
     rhi::PipelineHandle main_pipeline_;
     rhi::PipelineHandle main_two_sided_pipeline_;
+    rhi::PipelineHandle asset_shadow_pipeline_;
+    rhi::PipelineHandle asset_pipeline_;
+    rhi::PipelineHandle asset_two_sided_pipeline_;
     rhi::PipelineHandle composite_pipeline_;
     rhi::PipelineHandle bloom_down_pipeline_;
     rhi::PipelineHandle bloom_blur_h_pipeline_;
@@ -121,6 +157,11 @@ private:
     rhi::BufferHandle height_frame_buffer_;
     u32 frame_counter_ = 0;
     std::vector<GpuMesh> meshes_;
+    std::vector<PbrMaterial> materials_; // resolved: every texture valid
+    std::vector<rhi::TextureHandle> owned_textures_;
+    rhi::TextureHandle white_srgb_;
+    rhi::TextureHandle white_linear_;
+    rhi::TextureHandle flat_normal_;
     WorldRenderStats stats_;
 };
 
