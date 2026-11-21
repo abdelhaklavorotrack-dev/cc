@@ -56,6 +56,13 @@ struct WorldSettings {
     f32 bounce = 0.45f;      // screen-space colour bleed
     f32 bloom = 0.25f;
     f32 saturation = 1.06f;
+    // Internal resolution relative to the back buffer: 1.5 = supersampling ("ultra"), < 1 = faster.
+    f32 render_scale = 1.0f;
+    // One unshadowed point light (muzzle flash, torch...); zero colour disables it.
+    math::Vec3 point_light_position{0.0f, 0.0f, 0.0f};
+    math::Vec3 point_light_color{0.0f, 0.0f, 0.0f}; // radiance
+    f32 point_light_range = 8.0f;
+    f32 crosshair_px = 0.0f; // centred crosshair arm length in back-buffer pixels; 0 = none
 };
 
 // glTF-style metallic-roughness material for imported assets. Invalid textures fall back to
@@ -155,6 +162,8 @@ private:
     rhi::Extent hdr_extent_{};
     std::vector<rhi::BufferHandle> frame_buffers_;
     rhi::BufferHandle height_frame_buffer_;
+    math::Mat4 height_view_proj_ = math::Mat4::identity();
+    math::Vec3 height_params_{0.0f, 0.0f, 1.0f};
     u32 frame_counter_ = 0;
     std::vector<GpuMesh> meshes_;
     std::vector<PbrMaterial> materials_; // resolved: every texture valid
