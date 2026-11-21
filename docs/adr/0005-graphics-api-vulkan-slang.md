@@ -20,3 +20,9 @@ Windows. The choice must be validated on target hardware before the engine commi
 
 ## Consequences
 - No graphics code is merged before the RHI interface is reviewed under this ADR.
+
+## Progress
+- Criteria 2 and 3 are met by the Rendering Core work (ADR 0008): CPU/GPU frame times are reported by the
+  sandbox, and Slang → SPIR-V runs in the build. Hot reload is still to do.
+- Criterion 1 is verified on lavapipe (Linux, software) and an X11 swapchain, not yet on the reference
+  Windows GPUs.

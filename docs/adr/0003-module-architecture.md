@@ -23,9 +23,9 @@ Rules:
    | Layer | Modules |
    |-------|---------|
    | 0 | core (types, log, assert, time) |
-   | 1 | memory, jobs, platform |
-   | 2 | ecs, assets, serialization, rhi *(planned)* |
-   | 3 | scene, renderer, render-graph, physics, animation, audio *(planned)* |
+   | 1 | memory, jobs, platform, math |
+   | 2 | rhi; ecs, assets, serialization *(planned)* |
+   | 3 | renderer; scene, render-graph, physics, animation, audio *(planned)* |
    | 4 | runtime, editor *(planned)* |
 
 2. **Small public surfaces.** Prefer opaque types (pimpl) or interfaces at module boundaries so

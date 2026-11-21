@@ -5,13 +5,27 @@ add_executable(nova_tests
     jobs_tests.cpp
     platform_tests.cpp)
 target_link_libraries(nova_tests PRIVATE
-    Nova::core Nova::memory Nova::jobs Nova::platform doctest::doctest)
+    Nova::core Nova::memory Nova::jobs Nova::platform Nova::math doctest::doctest)
+if(NOVA_WITH_VULKAN)
+    target_sources(nova_tests PRIVATE math_tests.cpp)
+    target_link_libraries(nova_tests PRIVATE Nova::renderer)
+endif()
 nova_set_warnings(nova_tests)
 
 include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
 doctest_discover_tests(nova_tests)
 
-# Smoke test: the sandbox frame loop runs end-to-end without a display.
+if(NOVA_WITH_VULKAN)
+    # Real rendering through the RHI; exit code 77 = no Vulkan device => skipped.
+    add_executable(nova_gpu_tests gpu_tests.cpp)
+    target_link_libraries(nova_gpu_tests PRIVATE Nova::core Nova::renderer doctest::doctest)
+    nova_set_warnings(nova_gpu_tests)
+    add_test(NAME gpu.rendering COMMAND nova_gpu_tests)
+    set_tests_properties(gpu.rendering PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
+# Smoke test: the sandbox renders offscreen end-to-end.
 if(TARGET nova_sandbox)
     add_test(NAME sandbox.headless_smoke COMMAND nova_sandbox --headless --frames 120)
+    set_tests_properties(sandbox.headless_smoke PROPERTIES SKIP_RETURN_CODE 77)
 endif()

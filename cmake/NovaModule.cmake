@@ -13,7 +13,8 @@ function(nova_set_warnings target)
         endif()
     else()
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconversion
-            -Wno-sign-conversion)
+            -Wno-sign-conversion
+            -Wno-missing-field-initializers) # idiomatic `VkFoo info{VK_STRUCTURE_TYPE_FOO}`
         if(NOVA_WARNINGS_AS_ERRORS)
             target_compile_options(${target} PRIVATE -Werror)
         endif()
@@ -37,4 +38,26 @@ function(nova_add_module name)
         target_link_libraries(${target} PRIVATE ${ARG_PRIVATE_DEPS})
     endif()
     nova_set_warnings(${target})
+endfunction()
+
+# nova_add_shader(<target> <file.slang> <symbol>)
+#   Compiles all entry points of a Slang file to one SPIR-V module and embeds it as
+#   `inline constexpr std::uint32_t <symbol>[]` in <symbol>.hpp, reachable from <target>.
+function(nova_add_shader target source symbol)
+    get_filename_component(src "${source}" ABSOLUTE)
+    set(out_dir "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+    set(spv "${out_dir}/${symbol}.spv")
+    set(hpp "${out_dir}/${symbol}.hpp")
+    add_custom_command(
+        OUTPUT "${hpp}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${out_dir}"
+        COMMAND "${NOVA_SLANGC}" "${src}" -target spirv -profile spirv_1_3
+                -matrix-layout-column-major -fvk-use-entrypoint-name -O2 -o "${spv}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${spv} -DOUTPUT=${hpp} -DSYMBOL=${symbol}
+                -P "${PROJECT_SOURCE_DIR}/cmake/EmbedSpirv.cmake"
+        DEPENDS "${src}" "${PROJECT_SOURCE_DIR}/cmake/EmbedSpirv.cmake"
+        COMMENT "Compiling shader ${source}"
+        VERBATIM)
+    target_sources(${target} PRIVATE "${hpp}")
+    target_include_directories(${target} PRIVATE "${out_dir}")
 endfunction()

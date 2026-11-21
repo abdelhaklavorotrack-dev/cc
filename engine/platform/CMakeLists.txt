@@ -1,6 +1,7 @@
 nova_add_module(platform
     SOURCES
         src/input.cpp
+        src/vulkan.cpp
         src/window.cpp
     PUBLIC_DEPS
         Nova::core)
