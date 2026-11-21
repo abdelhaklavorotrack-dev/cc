@@ -119,6 +119,7 @@ public:
     void set_title(const std::string& title) override { SDL_SetWindowTitle(window_, title.c_str()); }
     Backend backend() const noexcept override { return Backend::SDL3; }
     void* native_handle() const noexcept override { return window_; }
+    void set_mouse_captured(bool captured) override { SDL_SetWindowRelativeMouseMode(window_, captured); }
 
 private:
     SDL_Window* window_;
