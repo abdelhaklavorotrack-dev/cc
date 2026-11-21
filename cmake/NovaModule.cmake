@@ -8,6 +8,8 @@
 function(nova_set_warnings target)
     if(MSVC)
         target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8 /Zc:__cplusplus)
+        # Portable C functions (fopen, getenv) over MSVC-only *_s variants.
+        target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
         if(NOVA_WARNINGS_AS_ERRORS)
             target_compile_options(${target} PRIVATE /WX)
         endif()
