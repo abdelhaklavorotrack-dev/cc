@@ -1,9 +1,9 @@
 name: CI
 
 on:
+  # All branches, so work branches get Windows/Linux/sanitizer results before a PR exists.
   push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
