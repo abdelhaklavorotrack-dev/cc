@@ -41,11 +41,20 @@ struct WorldSettings {
     f32 ambient = 0.7f;
     f32 fog_density = 0.0006f;
     f32 fog_height_falloff = 0.016f;
-    f32 exposure = 0.75f;
+    f32 exposure = 0.68f;
     f32 time = 0.0f;
     // Area covered by the sun shadow map (orthographic, centred on shadow_center).
     math::Vec3 shadow_center{0, 0, 0};
     f32 shadow_radius = 50.0f;
+    // Contact AO: height map of the level covering shadow_center +- contact_ao_extent.
+    f32 contact_ao = 0.7f;
+    f32 contact_ao_radius = 2.5f;
+    f32 contact_ao_extent = 60.0f;
+    f32 ssao = 0.8f;         // 0 disables
+    f32 ssao_radius = 0.7f;  // metres
+    f32 bounce = 0.45f;      // screen-space colour bleed
+    f32 bloom = 0.25f;
+    f32 saturation = 1.06f;
 };
 
 struct WorldDrawItem {
@@ -60,8 +69,8 @@ struct WorldRenderStats {
     u32 triangles = 0;
 };
 
-// HDR forward renderer: sun shadow map -> sky + lit geometry into an RGBA16F target ->
-// ACES tonemap and colour grade into the back buffer.
+// HDR forward renderer: contact-AO height map (once) + sun shadow map -> sky and lit geometry into
+// RGBA16F + depth -> SSAO and colour bleed -> quarter-res bloom -> tonemap, FXAA and warm grade.
 class WorldRenderer {
 public:
     explicit WorldRenderer(rhi::Device& device, u32 shadow_map_size = 2048);
@@ -74,6 +83,8 @@ public:
 
     bool render_frame(const Camera& camera, const WorldSettings& settings, std::span<const WorldDrawItem> items);
     [[nodiscard]] const WorldRenderStats& stats() const noexcept { return stats_; }
+    // The contact-AO height map is captured once; call after moving or replacing level geometry.
+    void invalidate_contact_ao() noexcept { height_dirty_ = true; }
 
 private:
     struct GpuMesh {
@@ -82,21 +93,32 @@ private:
         u32 index_count = 0;
     };
 
-    bool ensure_hdr_target(rhi::Extent extent);
+    bool ensure_targets(rhi::Extent extent);
 
     rhi::Device& device_;
     u32 shadow_size_;
     bool valid_ = false;
-    rhi::ShaderHandle shaders_[8]{};
+    bool height_dirty_ = true;
+    rhi::ShaderHandle shaders_[12]{};
     rhi::PipelineHandle shadow_pipeline_;
     rhi::PipelineHandle sky_pipeline_;
     rhi::PipelineHandle main_pipeline_;
     rhi::PipelineHandle main_two_sided_pipeline_;
+    rhi::PipelineHandle composite_pipeline_;
+    rhi::PipelineHandle bloom_down_pipeline_;
+    rhi::PipelineHandle bloom_blur_h_pipeline_;
+    rhi::PipelineHandle bloom_blur_v_pipeline_;
     rhi::PipelineHandle post_pipeline_;
     rhi::TextureHandle shadow_map_;
+    rhi::TextureHandle height_map_;
     rhi::TextureHandle hdr_target_;
+    rhi::TextureHandle scene_depth_;
+    rhi::TextureHandle lit_target_;
+    rhi::TextureHandle bloom_a_;
+    rhi::TextureHandle bloom_b_;
     rhi::Extent hdr_extent_{};
     std::vector<rhi::BufferHandle> frame_buffers_;
+    rhi::BufferHandle height_frame_buffer_;
     u32 frame_counter_ = 0;
     std::vector<GpuMesh> meshes_;
     WorldRenderStats stats_;

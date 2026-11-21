@@ -30,6 +30,14 @@ using math::Vec4;
 using renderer::Material;
 using renderer::MeshData;
 
+#if defined(_WIN32)
+// Ask hybrid-graphics laptop drivers to run this process on the dedicated NVIDIA / AMD GPU.
+extern "C" {
+__declspec(dllexport) unsigned long NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+#endif
+
 namespace {
 
 constexpr int kExitNoGpu = 77;
@@ -546,7 +554,8 @@ int main(int argc, char** argv) {
         NOVA_ERROR("Village", "no usable Vulkan device");
         return kExitNoGpu;
     }
-    renderer::WorldRenderer world(*device);
+    // Hardware GPUs get a 4K shadow map (crisper, longer shadows); software rasterisers stay at 2K.
+    renderer::WorldRenderer world(*device, device->info().software ? 2048u : 4096u);
     if (!world.valid()) {
         return 1;
     }

@@ -5,6 +5,7 @@
 struct FrameData {
     float4x4 view_proj;
     float4x4 light_view_proj;
+    float4x4 height_view_proj; // top-down orthographic view of the level (contact AO)
     float4 camera_pos;     // xyz, w = time (s)
     float4 camera_right;   // xyz, w = tan(fov/2) * aspect
     float4 camera_up;      // xyz, w = tan(fov/2)
@@ -14,11 +15,19 @@ struct FrameData {
     float4 sky_zenith;     // rgb, w = fog density
     float4 sky_horizon;    // rgb, w = fog height falloff
     float4 ground_color;   // rgb, w = ambient strength
+    float4 camera_clip;    // x near, y far, z contact-AO strength, w SSAO strength
+    float4 height_params;  // x height-camera y, y its near plane, z depth range, w contact-AO radius
+    float4 post_params;    // x bloom, y saturation, z colour bounce, w SSAO radius
+    float4 screen;         // xy = 1 / size, zw = size (pixels)
 };
 
 [[vk::binding(0, 0)]] ConstantBuffer<FrameData> frame;
 [[vk::binding(1, 0)]] Sampler2D<float> shadow_map;
 [[vk::binding(2, 0)]] Sampler2D<float4> hdr_scene;
+[[vk::binding(3, 0)]] Sampler2D<float> scene_depth;
+[[vk::binding(4, 0)]] Sampler2D<float4> bloom_tex;
+[[vk::binding(5, 0)]] Sampler2D<float> height_map; // top-down depth of the level
+[[vk::binding(6, 0)]] Sampler2D<float4> post_src;
 
 struct ObjectData {
     float4x4 model;
@@ -256,6 +265,39 @@ float sample_shadow(float3 p, float3 n) {
     return lit / 12.0;
 }
 
+// Contact AO from a top-down height map of the level: anything standing taller than the surface
+// within a radius darkens it with a warm, earthy tint (wall bases, alleys, under eaves).
+float3 contact_ao(float3 p, float3 n) {
+    const float strength = frame.camera_clip.z;
+    const float R = frame.height_params.w;
+    if (strength <= 0.0) {
+        return 1.0;
+    }
+    float4 c0 = mul(frame.height_view_proj, float4(p, 1.0));
+    float2 uv0 = c0.xy * 0.5 + 0.5;
+    if (any(uv0 < 0.0) || any(uv0 > 1.0)) {
+        return 1.0;
+    }
+    // Orthographic, so world xz maps to uv affinely.
+    float2 du_dx = mul(frame.height_view_proj, float4(1, 0, 0, 0)).xy * 0.5;
+    float2 du_dz = mul(frame.height_view_proj, float4(0, 0, 1, 0)).xy * 0.5;
+    float2 centre = n.xz * R;
+    float occ = 0.0, wsum = 0.0;
+    for (int i = 0; i < 16; ++i) {
+        float f = float(i) + 0.5;
+        float a = f * 2.39996;
+        float r = sqrt(f / 16.0) * R * 0.9;
+        float2 q = centre + float2(cos(a), sin(a)) * r;
+        float d = height_map.SampleLevel(uv0 + du_dx * q.x + du_dz * q.y, 0.0);
+        float h = frame.height_params.x - (frame.height_params.y + d * frame.height_params.z);
+        float w = 1.0 - r / R;
+        occ += saturate((h - p.y - 0.2) / (R * 0.8)) * w;
+        wsum += w;
+    }
+    float ao = 1.0 - strength * saturate(occ / wsum * 1.15) * 0.75;
+    return lerp(float3(0.5, 0.34, 0.24), 1.0, smoothstep(0.2, 1.0, ao));
+}
+
 struct Surface {
     float3 albedo;
     float3 normal;
@@ -416,11 +458,14 @@ float4 mainFS(VSOutput input, bool front_face : SV_IsFrontFace) : SV_Target {
 
     // Hemisphere ambient: sky from above, warm sunlit-ground bounce from below.
     float3 sky_amb = frame.sky_zenith.rgb * 0.9 + frame.sky_horizon.rgb * 0.3;
+    // Partly desaturated so shade reads warm-neutral, not blue (matches the reference look).
+    sky_amb = lerp(dot(sky_amb, float3(0.2126, 0.7152, 0.0722)) * float3(1.08, 1.0, 0.9), sky_amb, 0.55);
     float3 ground_amb = frame.ground_color.rgb * frame.sun_color.rgb * 0.4;
     float3 ambient = lerp(ground_amb, sky_amb, n.y * 0.5 + 0.5) * frame.ground_color.w;
 
-    float3 direct = frame.sun_color.rgb * ndl * shadow;
-    float3 color = s.albedo * (direct + ambient * ao);
+    float3 cao = contact_ao(p, normalize(input.normal));
+    float3 direct = frame.sun_color.rgb * ndl * shadow * lerp(1.0, cao, 0.5);
+    float3 color = s.albedo * (direct + ambient * ao * cao);
     // Rough materials keep only a faint sheen; otherwise dusty ground glows at grazing angles.
     float spec_scale = lerp(1.0, 0.15, smoothstep(0.6, 0.95, s.roughness));
     color += frame.sun_color.rgb * ggx_specular(n, v, l, s.roughness) * ndl * shadow * spec_scale;
@@ -441,11 +486,153 @@ float4 mainFS(VSOutput input, bool front_face : SV_IsFrontFace) : SV_Target {
     return float4(color, 1.0);
 }
 
-// ------------------------------------------------------------------ post: tonemap + grade
+// ------------------------------------------------------------------ post: SSAO + colour bleed
+
+float linear_depth(float d) {
+    const float n = frame.camera_clip.x, f = frame.camera_clip.y;
+    return n * f / (f - d * (f - n));
+}
+
+// World position of a screen uv at view depth t.
+float3 screen_to_world(float2 uv, float t) {
+    float2 ndc = uv * 2.0 - 1.0;
+    float3 dir = frame.camera_forward.xyz + frame.camera_right.xyz * ndc.x * frame.camera_right.w -
+                 frame.camera_up.xyz * ndc.y * frame.camera_up.w;
+    return frame.camera_pos.xyz + dir * t;
+}
+
+float3 world_at(float2 uv) {
+    return screen_to_world(uv, linear_depth(scene_depth.SampleLevel(uv, 0.0)));
+}
+
+float ssao(float2 uv, float3 p, float t, float2 pixel) {
+    const float2 px = frame.screen.xy;
+    // Normal from the neighbour pair closest in depth on each axis (stable across silhouettes).
+    float3 l = world_at(uv - float2(px.x, 0)), r = world_at(uv + float2(px.x, 0));
+    float3 u = world_at(uv - float2(0, px.y)), d = world_at(uv + float2(0, px.y));
+    float3 dx = distance(r, p) < distance(l, p) ? r - p : p - l;
+    float3 dy = distance(d, p) < distance(u, p) ? d - p : p - u;
+    float3 n = normalize(cross(dy, dx));
+    if (dot(n, frame.camera_pos.xyz - p) < 0.0) {
+        n = -n;
+    }
+    float3 t1 = normalize(abs(n.y) < 0.99 ? cross(n, float3(0, 1, 0)) : cross(n, float3(1, 0, 0)));
+    float3 t2 = cross(n, t1);
+
+    const float radius = frame.post_params.w * (1.0 + t * 0.02);
+    float spin = hash13(float3(pixel, 3.0)) * 6.2831;
+    float occ = 0.0;
+    const int kSamples = 16;
+    for (int i = 0; i < kSamples; ++i) {
+        float f = (float(i) + 0.5) / float(kSamples);
+        float a = float(i) * 2.39996 + spin;
+        float z = sqrt(1.0 - f); // cosine-weighted hemisphere
+        float rr = sqrt(f);
+        float3 h = t1 * (cos(a) * rr) + t2 * (sin(a) * rr) + n * z;
+        float scale = lerp(0.15, 1.0, f * f); // denser near the centre
+        float3 s = p + n * 0.02 + h * radius * scale;
+        float4 cs = mul(frame.view_proj, float4(s, 1.0));
+        float2 suv = cs.xy / cs.w * 0.5 + 0.5;
+        if (any(suv < 0.0) || any(suv > 1.0)) {
+            continue;
+        }
+        float scene_t = linear_depth(scene_depth.SampleLevel(suv, 0.0));
+        float range = saturate(radius / abs(t - scene_t));
+        occ += (scene_t < cs.w - 0.03 ? 1.0 : 0.0) * range;
+    }
+    return 1.0 - occ / float(kSamples) * frame.camera_clip.w;
+}
+
+[shader("fragment")]
+float4 compositeFS(FullscreenOut input) : SV_Target {
+    const float2 uv = input.uv;
+    const float exposure = frame.camera_forward.w;
+    float3 c = hdr_scene.SampleLevel(uv, 0.0).rgb;
+    float d = scene_depth.SampleLevel(uv, 0.0);
+    if (d < 1.0 && frame.camera_clip.w > 0.0) {
+        float t = linear_depth(d);
+        c *= ssao(uv, screen_to_world(uv, t), t, input.position.xy);
+    }
+
+    // Screen-space colour bleed: nearby lit surfaces tint the shadows (cheap one-bounce look).
+    const float bounce = frame.post_params.z;
+    if (bounce > 0.0) {
+        float3 e = c * exposure;
+        float l = dot(e, float3(0.2126, 0.7152, 0.0722));
+        float sh = 1.0 - smoothstep(0.05, 0.7, l);
+        if (sh > 0.0) {
+            const float2 step_px = frame.screen.xy * (90.0 * frame.screen.w / 900.0);
+            float3 acc = 0.0;
+            float wsum = 0.0;
+            for (int i = 0; i < 16; ++i) {
+                float f = float(i) + 0.5;
+                float a = f * 2.39996;
+                float2 o = float2(cos(a), sin(a)) * sqrt(f / 16.0) * step_px;
+                float3 s = min(hdr_scene.SampleLevel(uv + o, 0.0).rgb * exposure, 4.0);
+                float k = 1.0 + dot(s, 0.33);
+                acc += s * k;
+                wsum += k;
+            }
+            acc /= wsum;
+            e += acc * bounce * sh * (e + 0.15) * 0.5;
+            c = e / exposure;
+        }
+    }
+    return float4(c, 1.0);
+}
+
+// ------------------------------------------------------------------ post: bloom (quarter resolution)
+
+[shader("fragment")]
+float4 bloomDownFS(FullscreenOut input) : SV_Target {
+    const float2 px = frame.screen.xy; // full-resolution texel
+    float3 c = post_src.SampleLevel(input.uv + float2(-px.x, -px.y), 0.0).rgb;
+    c += post_src.SampleLevel(input.uv + float2(px.x, -px.y), 0.0).rgb;
+    c += post_src.SampleLevel(input.uv + float2(-px.x, px.y), 0.0).rgb;
+    c += post_src.SampleLevel(input.uv + float2(px.x, px.y), 0.0).rgb;
+    c *= 0.25 * frame.camera_forward.w;
+    float l = dot(c, float3(0.2126, 0.7152, 0.0722));
+    // Soft-knee threshold around 0.9 (exposed, pre-tonemap units).
+    float knee = clamp(l - 0.6, 0.0, 0.6);
+    float w = max(knee * knee / 2.4, l - 0.9) / max(l, 1e-4);
+    return float4(min(c * w, 16.0), 1.0);
+}
+
+float3 blur9(float2 uv, float2 dir) {
+    const float w[5] = {0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216};
+    float3 c = post_src.SampleLevel(uv, 0.0).rgb * w[0];
+    for (int i = 1; i < 5; ++i) {
+        c += post_src.SampleLevel(uv + dir * float(i), 0.0).rgb * w[i];
+        c += post_src.SampleLevel(uv - dir * float(i), 0.0).rgb * w[i];
+    }
+    return c;
+}
+
+[shader("fragment")]
+float4 bloomBlurHFS(FullscreenOut input) : SV_Target {
+    return float4(blur9(input.uv, float2(frame.screen.x * 6.0, 0.0)), 1.0);
+}
+
+[shader("fragment")]
+float4 bloomBlurVFS(FullscreenOut input) : SV_Target {
+    return float4(blur9(input.uv, float2(0.0, frame.screen.y * 6.0)), 1.0);
+}
+
+// ------------------------------------------------------------------ post: tonemap, AA, grade
 
 float3 aces_fitted(float3 x) {
     const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
     return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+}
+
+float3 tonemapped(float2 uv) {
+    float3 hdr = hdr_scene.SampleLevel(uv, 0.0).rgb * frame.camera_forward.w;
+    hdr += bloom_tex.SampleLevel(uv, 0.0).rgb * frame.post_params.x;
+    return aces_fitted(hdr);
+}
+
+float luma_of(float3 c) {
+    return dot(c, float3(0.299, 0.587, 0.114));
 }
 
 [shader("vertex")]
@@ -455,20 +642,38 @@ FullscreenOut postVS(uint id : SV_VertexID) {
 
 [shader("fragment")]
 float4 postFS(FullscreenOut input) : SV_Target {
-    float3 hdr = hdr_scene.Sample(input.uv).rgb * frame.camera_forward.w;
-    float3 c = aces_fitted(hdr);
+    const float2 uv = input.uv;
+    const float2 px = frame.screen.xy;
 
-    // Split toning: cool shadows, warm highlights (the "golden hour" look).
-    float luma = dot(c, float3(0.2126, 0.7152, 0.0722));
-    c *= lerp(float3(0.92, 0.98, 1.08), float3(1.04, 1.0, 0.94), smoothstep(0.08, 0.6, luma));
-    // Gentle saturation and contrast.
-    c = lerp(float3(luma, luma, luma), c, 1.12);
-    c = saturate(c);
-    c = c * c * (3.0 - 2.0 * c) * 0.4 + c * 0.6;
+    // FXAA (console variant) on the tonemapped image.
+    float3 m = tonemapped(uv);
+    float l_nw = luma_of(tonemapped(uv + float2(-px.x, -px.y)));
+    float l_ne = luma_of(tonemapped(uv + float2(px.x, -px.y)));
+    float l_sw = luma_of(tonemapped(uv + float2(-px.x, px.y)));
+    float l_se = luma_of(tonemapped(uv + float2(px.x, px.y)));
+    float l_m = luma_of(m);
+    float l_min = min(l_m, min(min(l_nw, l_ne), min(l_sw, l_se)));
+    float l_max = max(l_m, max(max(l_nw, l_ne), max(l_sw, l_se)));
+    float3 c = m;
+    if (l_max - l_min > max(0.0312, l_max * 0.125)) {
+        float2 dir = float2(-((l_nw + l_ne) - (l_sw + l_se)), (l_nw + l_sw) - (l_ne + l_se));
+        float reduce = max((l_nw + l_ne + l_sw + l_se) * 0.03125, 1.0 / 128.0);
+        float inv = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);
+        dir = clamp(dir * inv, -8.0, 8.0) * px;
+        float3 a = 0.5 * (tonemapped(uv + dir * (1.0 / 3.0 - 0.5)) + tonemapped(uv + dir * (2.0 / 3.0 - 0.5)));
+        float3 b = a * 0.5 + 0.25 * (tonemapped(uv - dir * 0.5) + tonemapped(uv + dir * 0.5));
+        float l_b = luma_of(b);
+        c = (l_b < l_min || l_b > l_max) ? a : b;
+    }
 
-    // Vignette.
-    float2 q = input.uv - 0.5;
-    c *= 1.0 - dot(q, q) * 0.55;
+    // Warm grade: vignette, saturation (a touch more in the shadows), warm shadow tint, contrast.
+    float dist = distance(uv, 0.5);
+    c *= smoothstep(0.95, 0.35, dist) * 0.4 + 0.6;
+    float l = dot(c, float3(0.2126, 0.7152, 0.0722));
+    float k = smoothstep(0.0, 0.6, l);
+    c = lerp(float3(l, l, l), c, frame.post_params.y * (1.0 + 0.1 * (1.0 - k)));
+    c *= lerp(float3(1.06, 0.97, 0.86), float3(1.03, 1.0, 0.95), k);
+    c = saturate((c - 0.18) * 1.1 + 0.18);
 
     // Triangular dither hides banding in the 8-bit output.
     float noise = hash13(float3(input.position.xy, 1.0)) - hash13(float3(input.position.yx, 2.0));

@@ -14,9 +14,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <optional>
+#include <string_view>
 
 namespace nova::rhi {
 namespace {
@@ -456,6 +458,12 @@ bool VulkanDevice::pick_physical_device() {
         case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: score = 2; break;
         case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: score = 1; break;
         default: score = 0; break;
+        }
+        // Discrete NVIDIA first on multi-GPU (Optimus) machines; NOVA_GPU=<name substring> overrides.
+        score = score * 10 + (props.vendorID == 0x10DE ? 1 : 0);
+        if (const char* wanted = std::getenv("NOVA_GPU");
+            wanted && *wanted && std::string_view(props.deviceName).find(wanted) != std::string_view::npos) {
+            score += 1000;
         }
         if (score > best_score) {
             best_score = score;

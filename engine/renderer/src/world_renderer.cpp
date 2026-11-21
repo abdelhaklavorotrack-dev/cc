@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <initializer_list>
+#include <vector>
 
 namespace nova::renderer {
 namespace {
@@ -18,6 +20,7 @@ using math::Vec3;
 struct FrameData {
     Mat4 view_proj;
     Mat4 light_view_proj;
+    Mat4 height_view_proj;
     f32 camera_pos[4];
     f32 camera_right[4];
     f32 camera_up[4];
@@ -27,8 +30,12 @@ struct FrameData {
     f32 sky_zenith[4];
     f32 sky_horizon[4];
     f32 ground_color[4];
+    f32 camera_clip[4];
+    f32 height_params[4];
+    f32 post_params[4];
+    f32 screen[4];
 };
-static_assert(sizeof(FrameData) == 128 + 9 * 16);
+static_assert(sizeof(FrameData) == 192 + 13 * 16);
 
 void set4(f32 (&dst)[4], const Vec3& v, f32 w) {
     dst[0] = v.x;
@@ -37,7 +44,12 @@ void set4(f32 (&dst)[4], const Vec3& v, f32 w) {
     dst[3] = w;
 }
 
-enum ShaderSlot { kSkyVS, kSkyFS, kShadowVS, kShadowFS, kMainVS, kMainFS, kPostVS, kPostFS };
+enum ShaderSlot {
+    kSkyVS, kSkyFS, kShadowVS, kShadowFS, kMainVS, kMainFS,
+    kPostVS, kPostFS, kCompositeFS, kBloomDownFS, kBloomBlurHFS, kBloomBlurVFS,
+    kShaderCount
+};
+constexpr u32 kHeightMapSize = 1024;
 
 constexpr rhi::Format kHdrFormat = rhi::Format::RGBA16_Float;
 
@@ -49,13 +61,15 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
         const char* name;
         rhi::ShaderStage stage;
     };
-    const Entry entries[8] = {
+    const Entry entries[kShaderCount] = {
         {"skyVS", rhi::ShaderStage::Vertex},    {"skyFS", rhi::ShaderStage::Fragment},
         {"shadowVS", rhi::ShaderStage::Vertex}, {"shadowFS", rhi::ShaderStage::Fragment},
         {"mainVS", rhi::ShaderStage::Vertex},   {"mainFS", rhi::ShaderStage::Fragment},
         {"postVS", rhi::ShaderStage::Vertex},   {"postFS", rhi::ShaderStage::Fragment},
+        {"compositeFS", rhi::ShaderStage::Fragment}, {"bloomDownFS", rhi::ShaderStage::Fragment},
+        {"bloomBlurHFS", rhi::ShaderStage::Fragment}, {"bloomBlurVFS", rhi::ShaderStage::Fragment},
     };
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < kShaderCount; ++i) {
         shaders_[i] = device_.create_shader({world_spv, entries[i].name, entries[i].stage});
         if (!shaders_[i].valid()) {
             NOVA_ERROR("Renderer", "failed to create world shader {}", entries[i].name);
@@ -97,28 +111,52 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
     main.vertex_stride = sizeof(Vertex);
     main.attributes = attributes;
     main.push_constant_size = sizeof(Mat4);
-    main.bindings = {frame_binding, {1, rhi::BindingType::SampledTexture, rhi::Filter::Nearest}};
+    main.bindings = {frame_binding,
+                     {1, rhi::BindingType::SampledTexture, rhi::Filter::Nearest},
+                     {5, rhi::BindingType::SampledTexture, rhi::Filter::Nearest}};
     main.color_format = kHdrFormat;
     main_pipeline_ = device_.create_graphics_pipeline(main);
     main.cull = rhi::CullMode::None;
     main_two_sided_pipeline_ = device_.create_graphics_pipeline(main);
 
-    rhi::GraphicsPipelineDesc post;
-    post.vertex_shader = shaders_[kPostVS];
-    post.fragment_shader = shaders_[kPostFS];
-    post.bindings = {frame_binding, {2, rhi::BindingType::SampledTexture, rhi::Filter::Linear}};
-    post.cull = rhi::CullMode::None;
-    post.depth_test = false;
-    post.depth_format = rhi::Format::Undefined;
-    post_pipeline_ = device_.create_graphics_pipeline(post);
+    auto fullscreen = [&](ShaderSlot fs, std::vector<rhi::BindingDesc> bindings, rhi::Format color) {
+        rhi::GraphicsPipelineDesc desc;
+        desc.vertex_shader = shaders_[kPostVS];
+        desc.fragment_shader = shaders_[fs];
+        desc.bindings = std::move(bindings);
+        desc.cull = rhi::CullMode::None;
+        desc.depth_test = false;
+        desc.depth_format = rhi::Format::Undefined;
+        desc.color_format = color;
+        return device_.create_graphics_pipeline(desc);
+    };
+    using BT = rhi::BindingType;
+    composite_pipeline_ = fullscreen(kCompositeFS,
+                                     {frame_binding,
+                                      {2, BT::SampledTexture, rhi::Filter::Linear},
+                                      {3, BT::SampledTexture, rhi::Filter::Nearest}},
+                                     kHdrFormat);
+    const std::vector<rhi::BindingDesc> src_bindings = {frame_binding, {6, BT::SampledTexture, rhi::Filter::Linear}};
+    bloom_down_pipeline_ = fullscreen(kBloomDownFS, src_bindings, kHdrFormat);
+    bloom_blur_h_pipeline_ = fullscreen(kBloomBlurHFS, src_bindings, kHdrFormat);
+    bloom_blur_v_pipeline_ = fullscreen(kBloomBlurVFS, src_bindings, kHdrFormat);
+    post_pipeline_ = fullscreen(kPostFS,
+                                {frame_binding,
+                                 {2, BT::SampledTexture, rhi::Filter::Linear},
+                                 {4, BT::SampledTexture, rhi::Filter::Linear}},
+                                rhi::Format::BackBuffer);
 
     shadow_map_ = device_.create_texture({shadow_size_, shadow_size_, rhi::Format::D32_Float, true, true});
+    height_map_ = device_.create_texture({kHeightMapSize, kHeightMapSize, rhi::Format::D32_Float, true, true});
     for (u32 i = 0; i < device_.frames_in_flight(); ++i) {
         frame_buffers_.push_back(device_.create_buffer({sizeof(FrameData), rhi::BufferUsage::Uniform, nullptr}));
     }
+    height_frame_buffer_ = device_.create_buffer({sizeof(FrameData), rhi::BufferUsage::Uniform, nullptr});
 
     valid_ = shadow_pipeline_.valid() && sky_pipeline_.valid() && main_pipeline_.valid() &&
-             main_two_sided_pipeline_.valid() && post_pipeline_.valid() && shadow_map_.valid() &&
+             main_two_sided_pipeline_.valid() && composite_pipeline_.valid() && bloom_down_pipeline_.valid() &&
+             bloom_blur_h_pipeline_.valid() && bloom_blur_v_pipeline_.valid() && post_pipeline_.valid() &&
+             shadow_map_.valid() && height_map_.valid() && height_frame_buffer_.valid() &&
              std::ranges::all_of(frame_buffers_, [](rhi::BufferHandle b) { return b.valid(); });
     if (!valid_) {
         NOVA_ERROR("Renderer", "world renderer initialisation failed");
@@ -133,10 +171,13 @@ WorldRenderer::~WorldRenderer() {
     for (rhi::BufferHandle b : frame_buffers_) {
         device_.destroy(b);
     }
-    device_.destroy(hdr_target_);
-    device_.destroy(shadow_map_);
-    for (rhi::PipelineHandle p :
-         {shadow_pipeline_, sky_pipeline_, main_pipeline_, main_two_sided_pipeline_, post_pipeline_}) {
+    device_.destroy(height_frame_buffer_);
+    for (rhi::TextureHandle t : {hdr_target_, scene_depth_, lit_target_, bloom_a_, bloom_b_, shadow_map_, height_map_}) {
+        device_.destroy(t);
+    }
+    for (rhi::PipelineHandle p : {shadow_pipeline_, sky_pipeline_, main_pipeline_, main_two_sided_pipeline_,
+                                  composite_pipeline_, bloom_down_pipeline_, bloom_blur_h_pipeline_,
+                                  bloom_blur_v_pipeline_, post_pipeline_}) {
         device_.destroy(p);
     }
     for (rhi::ShaderHandle s : shaders_) {
@@ -163,14 +204,23 @@ MeshId WorldRenderer::upload(const MeshData& mesh) {
     return {static_cast<u32>(meshes_.size())};
 }
 
-bool WorldRenderer::ensure_hdr_target(rhi::Extent extent) {
+bool WorldRenderer::ensure_targets(rhi::Extent extent) {
     if (hdr_target_.valid() && extent.width == hdr_extent_.width && extent.height == hdr_extent_.height) {
         return true;
     }
-    device_.destroy(hdr_target_);
+    for (rhi::TextureHandle t : {hdr_target_, scene_depth_, lit_target_, bloom_a_, bloom_b_}) {
+        device_.destroy(t);
+    }
+    const u32 qw = std::max(1u, extent.width / 4);
+    const u32 qh = std::max(1u, extent.height / 4);
     hdr_target_ = device_.create_texture({extent.width, extent.height, kHdrFormat, true, true});
+    scene_depth_ = device_.create_texture({extent.width, extent.height, rhi::Format::D32_Float, true, true});
+    lit_target_ = device_.create_texture({extent.width, extent.height, kHdrFormat, true, true});
+    bloom_a_ = device_.create_texture({qw, qh, kHdrFormat, true, true});
+    bloom_b_ = device_.create_texture({qw, qh, kHdrFormat, true, true});
     hdr_extent_ = extent;
-    return hdr_target_.valid();
+    return hdr_target_.valid() && scene_depth_.valid() && lit_target_.valid() && bloom_a_.valid() &&
+           bloom_b_.valid();
 }
 
 bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& settings,
@@ -179,7 +229,7 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
         return false;
     }
     const rhi::Extent extent = device_.back_buffer_extent();
-    if (extent.width == 0 || extent.height == 0 || !ensure_hdr_target(extent)) {
+    if (extent.width == 0 || extent.height == 0 || !ensure_targets(extent)) {
         return false;
     }
     rhi::CommandList* cmd = device_.begin_frame();
@@ -200,9 +250,19 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
                                           std::abs(sun.y) > 0.99f ? Vec3{0, 0, 1} : Vec3{0, 1, 0});
     const Mat4 light_proj = math::orthographic(-r, r, -r, r, 0.1f, r * 6.0f);
 
+    // Top-down camera for the contact-AO height map; depth is linear in height (orthographic).
+    const f32 he = settings.contact_ao_extent;
+    const f32 height_top = settings.shadow_center.y + he * 0.5f;
+    constexpr f32 kHeightNear = 0.1f;
+    const f32 height_range = he; // covers shadow_center.y +- extent / 2
+    const Vec3 height_eye{settings.shadow_center.x, height_top, settings.shadow_center.z};
+    const Mat4 height_view = math::look_at(height_eye, height_eye - Vec3{0, 1, 0}, Vec3{0, 0, -1});
+    const Mat4 height_proj = math::orthographic(-he, he, -he, he, kHeightNear, kHeightNear + height_range);
+
     FrameData fd{};
     fd.view_proj = camera.projection(aspect) * camera.view();
     fd.light_view_proj = light_proj * light_view;
+    fd.height_view_proj = height_proj * height_view;
     set4(fd.camera_pos, camera.position, settings.time);
     set4(fd.camera_right, right, tan_half * aspect);
     set4(fd.camera_up, up, tan_half);
@@ -212,6 +272,12 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
     set4(fd.sky_zenith, settings.sky_zenith, settings.fog_density);
     set4(fd.sky_horizon, settings.sky_horizon, settings.fog_height_falloff);
     set4(fd.ground_color, settings.ground_color, settings.ambient);
+    set4(fd.camera_clip, {camera.z_near, camera.z_far, settings.contact_ao}, settings.ssao);
+    set4(fd.height_params, {height_top, kHeightNear, height_range}, settings.contact_ao_radius);
+    set4(fd.post_params, {settings.bloom, settings.saturation, settings.bounce}, settings.ssao_radius);
+    set4(fd.screen, {1.0f / static_cast<f32>(extent.width), 1.0f / static_cast<f32>(extent.height),
+                     static_cast<f32>(extent.width)},
+         static_cast<f32>(extent.height));
 
     // One buffer per frame in flight: begin_frame() has waited for the GPU to finish this slot.
     const rhi::BufferHandle frame_buffer = frame_buffers_[frame_counter_ % frame_buffers_.size()];
@@ -232,35 +298,61 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
         ++stats_.draw_calls;
         stats_.triangles += mesh.index_count / 3;
     };
-
-    // ---- 1. sun shadow map
-    {
+    // Depth-only render of the shadow casters with `light_view_proj` taken from `constants`.
+    auto depth_pass = [&](rhi::TextureHandle target, const rhi::ResourceBinding& constants) {
         rhi::RenderPassDesc pass;
         pass.back_buffer = false;
-        pass.depth = shadow_map_;
+        pass.depth = target;
         cmd->begin_render_pass(pass);
         cmd->bind_pipeline(shadow_pipeline_);
-        cmd->bind_resources({&frame_res, 1});
+        cmd->bind_resources({&constants, 1});
         for (const WorldDrawItem& item : items) {
             if (item.casts_shadow) {
                 draw_mesh(item);
             }
         }
         cmd->end_render_pass();
+    };
+    auto fullscreen_pass = [&](rhi::TextureHandle target, rhi::PipelineHandle pipeline,
+                               std::initializer_list<rhi::ResourceBinding> textures) {
+        rhi::RenderPassDesc pass;
+        pass.back_buffer = !target.valid();
+        pass.color = target;
+        pass.default_depth = false;
+        cmd->begin_render_pass(pass);
+        cmd->bind_pipeline(pipeline);
+        std::vector<rhi::ResourceBinding> res{frame_res};
+        res.insert(res.end(), textures);
+        cmd->bind_resources(res);
+        cmd->draw(3);
+        cmd->end_render_pass();
+    };
+
+    // ---- 0. contact-AO height map (static level: captured once)
+    if (height_dirty_) {
+        FrameData hd = fd;
+        hd.light_view_proj = fd.height_view_proj;
+        device_.update_buffer(height_frame_buffer_, &hd, sizeof(hd));
+        depth_pass(height_map_, {0, height_frame_buffer_, {}});
+        height_dirty_ = false;
     }
 
-    // ---- 2. sky + lit geometry into HDR
+    // ---- 1. sun shadow map
+    depth_pass(shadow_map_, frame_res);
+
+    // ---- 2. sky + lit geometry into HDR colour + sampled depth
     {
         rhi::RenderPassDesc pass;
         pass.back_buffer = false;
         pass.color = hdr_target_;
+        pass.depth = scene_depth_;
         cmd->begin_render_pass(pass);
 
         cmd->bind_pipeline(sky_pipeline_);
         cmd->bind_resources({&frame_res, 1});
         cmd->draw(3);
 
-        const rhi::ResourceBinding main_res[] = {frame_res, {1, {}, shadow_map_}};
+        const rhi::ResourceBinding main_res[] = {frame_res, {1, {}, shadow_map_}, {5, {}, height_map_}};
         for (bool two_sided : {false, true}) {
             cmd->bind_pipeline(two_sided ? main_two_sided_pipeline_ : main_pipeline_);
             cmd->bind_resources(main_res);
@@ -273,17 +365,16 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
         cmd->end_render_pass();
     }
 
-    // ---- 3. tonemap + grade into the back buffer
-    {
-        rhi::RenderPassDesc pass;
-        pass.default_depth = false;
-        cmd->begin_render_pass(pass);
-        cmd->bind_pipeline(post_pipeline_);
-        const rhi::ResourceBinding post_res[] = {frame_res, {2, {}, hdr_target_}};
-        cmd->bind_resources(post_res);
-        cmd->draw(3);
-        cmd->end_render_pass();
-    }
+    // ---- 3. SSAO + screen-space colour bleed
+    fullscreen_pass(lit_target_, composite_pipeline_, {{2, {}, hdr_target_}, {3, {}, scene_depth_}});
+
+    // ---- 4. bloom: bright pass at quarter resolution, separable blur
+    fullscreen_pass(bloom_a_, bloom_down_pipeline_, {{6, {}, lit_target_}});
+    fullscreen_pass(bloom_b_, bloom_blur_h_pipeline_, {{6, {}, bloom_a_}});
+    fullscreen_pass(bloom_a_, bloom_blur_v_pipeline_, {{6, {}, bloom_b_}});
+
+    // ---- 5. tonemap + FXAA + grade into the back buffer
+    fullscreen_pass({}, post_pipeline_, {{2, {}, lit_target_}, {4, {}, bloom_a_}});
 
     device_.end_frame();
     return true;
