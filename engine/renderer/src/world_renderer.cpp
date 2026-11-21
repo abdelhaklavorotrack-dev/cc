@@ -35,8 +35,11 @@ struct FrameData {
     f32 height_params[4];
     f32 post_params[4];
     f32 screen[4];
+    f32 point_light[4]; // xyz position, w range
+    f32 point_color[4]; // rgb radiance, w crosshair size (px)
+    f32 output_size[4]; // back-buffer pixels
 };
-static_assert(sizeof(FrameData) == 192 + 13 * 16);
+static_assert(sizeof(FrameData) == 192 + 16 * 16);
 
 void set4(f32 (&dst)[4], const Vec3& v, f32 w) {
     dst[0] = v.x;
@@ -370,8 +373,12 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
     if (!valid_) {
         return false;
     }
-    const rhi::Extent extent = device_.back_buffer_extent();
-    if (extent.width == 0 || extent.height == 0 || !ensure_targets(extent)) {
+    const rhi::Extent output = device_.back_buffer_extent();
+    // Internal resolution: > 1 supersamples (the post pass filters it down to the back buffer).
+    const f32 scale = std::clamp(settings.render_scale, 0.25f, 2.0f);
+    const rhi::Extent extent{std::max(1u, static_cast<u32>(static_cast<f32>(output.width) * scale + 0.5f)),
+                             std::max(1u, static_cast<u32>(static_cast<f32>(output.height) * scale + 0.5f))};
+    if (output.width == 0 || output.height == 0 || !ensure_targets(extent)) {
         return false;
     }
     rhi::CommandList* cmd = device_.begin_frame();
@@ -393,18 +400,21 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
     const Mat4 light_proj = math::orthographic(-r, r, -r, r, 0.1f, r * 6.0f);
 
     // Top-down camera for the contact-AO height map; depth is linear in height (orthographic).
-    const f32 he = settings.contact_ao_extent;
-    const f32 height_top = settings.shadow_center.y + he * 0.5f;
-    constexpr f32 kHeightNear = 0.1f;
-    const f32 height_range = he; // covers shadow_center.y +- extent / 2
-    const Vec3 height_eye{settings.shadow_center.x, height_top, settings.shadow_center.z};
-    const Mat4 height_view = math::look_at(height_eye, height_eye - Vec3{0, 1, 0}, Vec3{0, 0, -1});
-    const Mat4 height_proj = math::orthographic(-he, he, -he, he, kHeightNear, kHeightNear + height_range);
+    // Fixed at capture time so the map stays valid while the shadow centre follows the player.
+    if (height_dirty_) {
+        const f32 he = settings.contact_ao_extent;
+        constexpr f32 kHeightNear = 0.1f;
+        const f32 height_top = settings.shadow_center.y + he * 0.5f;
+        const Vec3 height_eye{settings.shadow_center.x, height_top, settings.shadow_center.z};
+        const Mat4 height_view = math::look_at(height_eye, height_eye - Vec3{0, 1, 0}, Vec3{0, 0, -1});
+        height_view_proj_ = math::orthographic(-he, he, -he, he, kHeightNear, kHeightNear + he) * height_view;
+        height_params_ = {height_top, kHeightNear, he}; // depth range covers shadow_center.y +- extent / 2
+    }
 
     FrameData fd{};
     fd.view_proj = camera.projection(aspect) * camera.view();
     fd.light_view_proj = light_proj * light_view;
-    fd.height_view_proj = height_proj * height_view;
+    fd.height_view_proj = height_view_proj_;
     set4(fd.camera_pos, camera.position, settings.time);
     set4(fd.camera_right, right, tan_half * aspect);
     set4(fd.camera_up, up, tan_half);
@@ -415,11 +425,14 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
     set4(fd.sky_horizon, settings.sky_horizon, settings.fog_height_falloff);
     set4(fd.ground_color, settings.ground_color, settings.ambient);
     set4(fd.camera_clip, {camera.z_near, camera.z_far, settings.contact_ao}, settings.ssao);
-    set4(fd.height_params, {height_top, kHeightNear, height_range}, settings.contact_ao_radius);
+    set4(fd.height_params, height_params_, settings.contact_ao_radius);
     set4(fd.post_params, {settings.bloom, settings.saturation, settings.bounce}, settings.ssao_radius);
     set4(fd.screen, {1.0f / static_cast<f32>(extent.width), 1.0f / static_cast<f32>(extent.height),
                      static_cast<f32>(extent.width)},
          static_cast<f32>(extent.height));
+    set4(fd.point_light, settings.point_light_position, settings.point_light_range);
+    set4(fd.point_color, settings.point_light_color, settings.crosshair_px);
+    set4(fd.output_size, {static_cast<f32>(output.width), static_cast<f32>(output.height), 0.0f}, 0.0f);
 
     // One buffer per frame in flight: begin_frame() has waited for the GPU to finish this slot.
     const rhi::BufferHandle frame_buffer = frame_buffers_[frame_counter_ % frame_buffers_.size()];
