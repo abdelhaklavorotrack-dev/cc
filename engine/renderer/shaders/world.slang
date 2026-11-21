@@ -121,9 +121,9 @@ float3 sky_color(float3 dir) {
     if (h > 0.0) {
         float2 uv = dir.xz / (h + 0.12) * 1.6;
         float c = fbm(float3(uv, frame.camera_pos.w * 0.01), 5);
-        c = smoothstep(0.52, 0.8, c) * saturate(h * 6.0);
-        float3 cloud = lerp(frame.sky_horizon.rgb * 1.1, frame.sun_color.rgb * 0.35 + 0.25, pow(sd, 3.0));
-        col = lerp(col, cloud, c * 0.7);
+        c = smoothstep(0.48, 0.72, c) * saturate(h * 6.0);
+        float3 cloud = lerp(float3(0.92, 0.94, 1.0), frame.sun_color.rgb * 0.3 + 0.55, pow(sd, 3.0));
+        col = lerp(col, cloud, c * 0.85);
     }
 
     // Sun disk.
@@ -143,7 +143,7 @@ float3 apply_fog(float3 color, float3 world_pos) {
     float amount = density / falloff * exp(-ro.y * falloff) * (1.0 - exp(-dist * ry * falloff)) / ry;
     float f = saturate(1.0 - exp(-amount));
     float sd = max(dot(rd, frame.sun_dir.xyz), 0.0);
-    float3 fog_col = lerp(frame.sky_horizon.rgb, frame.sun_color.rgb * 0.45, pow(sd, 8.0) * 0.6);
+    float3 fog_col = lerp(frame.sky_horizon.rgb * 0.9, frame.sun_color.rgb * 0.3, pow(sd, 8.0) * 0.5);
     return lerp(color, fog_col, f);
 }
 
@@ -272,10 +272,10 @@ Surface terrain_surface(float3 p, float3 n) {
     float large = fbm(p * 0.02, 4);
     float detail = fbm(p * 0.6, 4);
 
-    float3 dirt = lerp(float3(0.36, 0.27, 0.19), float3(0.55, 0.44, 0.31), detail);
+    float3 dirt = lerp(float3(0.24, 0.16, 0.10), float3(0.43, 0.31, 0.20), detail);
     dirt *= 0.8 + 0.35 * value_noise(p * 7.0); // pebbles and grit
-    float3 dry_grass = lerp(float3(0.36, 0.33, 0.16), float3(0.52, 0.45, 0.24), detail);
-    float3 rock = lerp(float3(0.30, 0.24, 0.19), float3(0.52, 0.44, 0.36), fbm(p * float3(0.15, 0.6, 0.15), 4));
+    float3 dry_grass = lerp(float3(0.20, 0.23, 0.10), float3(0.36, 0.34, 0.16), detail);
+    float3 rock = lerp(float3(0.20, 0.17, 0.15), float3(0.42, 0.36, 0.31), fbm(p * float3(0.15, 0.6, 0.15), 4));
     float3 snow = float3(0.90, 0.92, 0.96);
 
     float grass_w = smoothstep(0.45, 0.62, large) * (1.0 - smoothstep(0.35, 0.6, slope));
@@ -411,12 +411,12 @@ float4 mainFS(VSOutput input, bool front_face : SV_IsFrontFace) : SV_Target {
     float shadow = sample_shadow(p, normalize(input.normal) * (front_face ? 1.0 : -1.0));
 
     // Contact occlusion: surfaces darken towards the ground they stand on.
-    float ao = id == MAT_TERRAIN || id == MAT_WATER ? 1.0 : lerp(0.45, 1.0, saturate(p.y / 1.3));
+    float ao = id == MAT_TERRAIN || id == MAT_WATER ? 1.0 : lerp(0.3, 1.0, saturate(p.y / 1.6));
     ao *= lerp(0.8, 1.0, saturate(n.y * 0.5 + 0.5));
 
     // Hemisphere ambient: sky from above, warm sunlit-ground bounce from below.
     float3 sky_amb = frame.sky_zenith.rgb * 0.9 + frame.sky_horizon.rgb * 0.3;
-    float3 ground_amb = frame.ground_color.rgb * frame.sun_color.rgb * 0.25;
+    float3 ground_amb = frame.ground_color.rgb * frame.sun_color.rgb * 0.4;
     float3 ambient = lerp(ground_amb, sky_amb, n.y * 0.5 + 0.5) * frame.ground_color.w;
 
     float3 direct = frame.sun_color.rgb * ndl * shadow;
@@ -460,11 +460,11 @@ float4 postFS(FullscreenOut input) : SV_Target {
 
     // Split toning: cool shadows, warm highlights (the "golden hour" look).
     float luma = dot(c, float3(0.2126, 0.7152, 0.0722));
-    c *= lerp(float3(0.93, 0.98, 1.06), float3(1.05, 1.0, 0.93), smoothstep(0.1, 0.7, luma));
+    c *= lerp(float3(0.92, 0.98, 1.08), float3(1.04, 1.0, 0.94), smoothstep(0.08, 0.6, luma));
     // Gentle saturation and contrast.
     c = lerp(float3(luma, luma, luma), c, 1.12);
     c = saturate(c);
-    c = c * c * (3.0 - 2.0 * c) * 0.25 + c * 0.75;
+    c = c * c * (3.0 - 2.0 * c) * 0.4 + c * 0.6;
 
     // Vignette.
     float2 q = input.uv - 0.5;

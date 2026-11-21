@@ -32,16 +32,16 @@ enum class Material : u8 {
 
 // Lighting and atmosphere for one view. Defaults give a late-afternoon sun.
 struct WorldSettings {
-    math::Vec3 sun_direction{0.8f, 0.36f, -0.3f}; // towards the sun
-    math::Vec3 sun_color{1.0f, 0.74f, 0.47f};
-    f32 sun_intensity = 3.5f;
-    math::Vec3 sky_zenith{0.20f, 0.38f, 0.70f};
-    math::Vec3 sky_horizon{0.86f, 0.72f, 0.56f};
-    math::Vec3 ground_color{0.55f, 0.42f, 0.30f};
-    f32 ambient = 0.5f;
-    f32 fog_density = 0.0016f;
+    math::Vec3 sun_direction{0.8f, 0.27f, -0.36f}; // towards the sun
+    math::Vec3 sun_color{1.0f, 0.74f, 0.50f};
+    f32 sun_intensity = 4.6f;
+    math::Vec3 sky_zenith{0.10f, 0.25f, 0.62f};
+    math::Vec3 sky_horizon{0.56f, 0.68f, 0.86f};
+    math::Vec3 ground_color{0.42f, 0.30f, 0.20f};
+    f32 ambient = 0.7f;
+    f32 fog_density = 0.0006f;
     f32 fog_height_falloff = 0.016f;
-    f32 exposure = 0.9f;
+    f32 exposure = 0.75f;
     f32 time = 0.0f;
     // Area covered by the sun shadow map (orthographic, centred on shadow_center).
     math::Vec3 shadow_center{0, 0, 0};
