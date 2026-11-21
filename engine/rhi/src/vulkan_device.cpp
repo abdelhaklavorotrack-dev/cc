@@ -95,6 +95,8 @@ struct Shader {
 struct Pipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    std::vector<BindingDesc> bindings;
     u32 push_constant_size = 0;
 };
 
@@ -104,13 +106,36 @@ struct Image {
     VkImageView view = VK_NULL_HANDLE;
 };
 
+struct Texture {
+    Image image;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkImageAspectFlags aspect = 0;
+    VkExtent2D extent{};
+    bool sampled = false;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+};
+
 struct Frame {
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     VkSemaphore image_available = VK_NULL_HANDLE;
+    VkDescriptorPool descriptors = VK_NULL_HANDLE; // reset every frame
     bool timestamps_pending = false;
 };
+
+VkFormat to_vk(Format f) {
+    switch (f) {
+    case Format::RGBA8_sRGB: return VK_FORMAT_R8G8B8A8_SRGB;
+    case Format::RGBA16_Float: return VK_FORMAT_R16G16B16A16_SFLOAT;
+    case Format::D32_Float: return VK_FORMAT_D32_SFLOAT;
+    case Format::Undefined:
+    case Format::BackBuffer: break;
+    }
+    return VK_FORMAT_UNDEFINED;
+}
+
+bool is_depth(VkFormat f) { return f == VK_FORMAT_D32_SFLOAT; }
 
 VkImageMemoryBarrier2 image_barrier(VkImage image, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to,
                                     VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
@@ -141,9 +166,11 @@ class VulkanDevice;
 class VulkanCommandList final : public CommandList {
 public:
     explicit VulkanCommandList(VulkanDevice& device) : device_(device) {}
-    void begin_render_pass(const ClearValues& clear) override;
+    using CommandList::begin_render_pass;
+    void begin_render_pass(const RenderPassDesc& desc) override;
     void end_render_pass() override;
     void bind_pipeline(PipelineHandle pipeline) override;
+    void bind_resources(std::span<const ResourceBinding> resources) override;
     void bind_vertex_buffer(BufferHandle buffer, usize offset) override;
     void bind_index_buffer(BufferHandle buffer, usize offset) override;
     void push_constants(const void* data, u32 size) override;
@@ -151,8 +178,10 @@ public:
     void draw_indexed(u32 index_count, u32 first_index, i32 vertex_offset) override;
 
     VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkDescriptorPool descriptors = VK_NULL_HANDLE;
     Pipeline* bound = nullptr;
     bool in_pass = false;
+    std::array<Texture*, 2> pass_textures{}; // render-target textures of the open pass
 
 private:
     VulkanDevice& device_;
@@ -172,9 +201,12 @@ public:
     void update_buffer(BufferHandle handle, const void* data, usize size, usize offset) override;
     ShaderHandle create_shader(const ShaderDesc& desc) override;
     PipelineHandle create_graphics_pipeline(const GraphicsPipelineDesc& desc) override;
+    TextureHandle create_texture(const TextureDesc& desc) override;
     void destroy(BufferHandle handle) override;
     void destroy(ShaderHandle handle) override;
     void destroy(PipelineHandle handle) override;
+    void destroy(TextureHandle handle) override;
+    u32 frames_in_flight() const noexcept override { return kFramesInFlight; }
 
     CommandList* begin_frame() override;
     void end_frame() override;
@@ -192,6 +224,9 @@ public:
     // Used by VulkanCommandList.
     Buffer* buffer(BufferHandle h) { return buffers_.get(h.id); }
     Pipeline* pipeline(PipelineHandle h) { return pipelines_.get(h.id); }
+    Texture* texture(TextureHandle h) { return textures_.get(h.id); }
+    VkDevice vk_device() const { return device_; }
+    VkSampler sampler(Filter f) const { return f == Filter::Linear ? linear_sampler_ : nearest_sampler_; }
     VkImage back_buffer_image() const { return swapchain_ ? swap_images_[image_index_] : offscreen_.image; }
     VkImageView back_buffer_view() const { return swapchain_ ? swap_views_[image_index_] : offscreen_.view; }
     const Image& depth() const { return depth_; }
@@ -213,7 +248,8 @@ private:
     bool create_depth();
     void destroy_targets();
     std::optional<u32> find_memory_type(u32 type_bits, VkMemoryPropertyFlags props) const;
-    bool allocate_image(VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect, Image& out);
+    bool allocate_image(VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect, VkExtent2D extent,
+                        Image& out);
     void destroy_image(Image& img);
     bool create_raw_buffer(usize size, VkBufferUsageFlags usage, Buffer& out);
     void destroy_raw_buffer(Buffer& b);
@@ -252,6 +288,9 @@ private:
     SlotPool<Buffer> buffers_;
     SlotPool<Shader> shaders_;
     SlotPool<Pipeline> pipelines_;
+    SlotPool<Texture> textures_;
+    VkSampler linear_sampler_ = VK_NULL_HANDLE;
+    VkSampler nearest_sampler_ = VK_NULL_HANDLE;
 
     f64 gpu_ms_ = -1.0;
     std::atomic<u32> validation_errors_{0};
@@ -373,9 +412,11 @@ bool VulkanDevice::pick_physical_device() {
             continue;
         }
         VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-        VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13};
+        VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f13};
+        VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11};
         vkGetPhysicalDeviceFeatures2(pd, &f2);
-        if (!f13.dynamicRendering || !f13.synchronization2) {
+        // shaderDrawParameters: SV_VertexID in Slang-generated SPIR-V (fullscreen passes).
+        if (!f13.dynamicRendering || !f13.synchronization2 || !f11.shaderDrawParameters) {
             continue;
         }
         if (surface_) {
@@ -449,9 +490,11 @@ bool VulkanDevice::create_device() {
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     f13.dynamicRendering = VK_TRUE;
     f13.synchronization2 = VK_TRUE;
+    VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f13};
+    f11.shaderDrawParameters = VK_TRUE;
 
     const char* swapchain_ext = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
-    VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f13};
+    VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f11};
     ci.queueCreateInfoCount = 1;
     ci.pQueueCreateInfos = &qci;
     ci.enabledExtensionCount = surface_ ? 1 : 0;
@@ -484,6 +527,30 @@ bool VulkanDevice::create_frames() {
             !vk_ok(vkCreateSemaphore(device_, &sci, nullptr, &f.image_available), "vkCreateSemaphore")) {
             return false;
         }
+        const std::array<VkDescriptorPoolSize, 2> sizes{{
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1024},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024},
+        }};
+        VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpci.maxSets = 1024;
+        dpci.poolSizeCount = static_cast<u32>(sizes.size());
+        dpci.pPoolSizes = sizes.data();
+        if (!vk_ok(vkCreateDescriptorPool(device_, &dpci, nullptr, &f.descriptors), "vkCreateDescriptorPool")) {
+            return false;
+        }
+    }
+    for (Filter filter : {Filter::Linear, Filter::Nearest}) {
+        const VkFilter vf = filter == Filter::Linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter = vf;
+        sci.minFilter = vf;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.maxLod = VK_LOD_CLAMP_NONE;
+        VkSampler& out = filter == Filter::Linear ? linear_sampler_ : nearest_sampler_;
+        if (!vk_ok(vkCreateSampler(device_, &sci, nullptr, &out), "vkCreateSampler")) {
+            return false;
+        }
     }
     if (info_.gpu_timing) {
         VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
@@ -505,11 +572,12 @@ std::optional<u32> VulkanDevice::find_memory_type(u32 type_bits, VkMemoryPropert
     return std::nullopt;
 }
 
-bool VulkanDevice::allocate_image(VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect, Image& out) {
+bool VulkanDevice::allocate_image(VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect,
+                                  VkExtent2D extent, Image& out) {
     VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = format;
-    ici.extent = {extent_.width, extent_.height, 1};
+    ici.extent = {extent.width, extent.height, 1};
     ici.mipLevels = 1;
     ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -549,14 +617,15 @@ void VulkanDevice::destroy_image(Image& img) {
 }
 
 bool VulkanDevice::create_depth() {
-    return allocate_image(kDepthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, depth_);
+    return allocate_image(kDepthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, extent_,
+                          depth_);
 }
 
 bool VulkanDevice::create_offscreen_target() {
     extent_ = {desc_.width, desc_.height};
     color_format_ = kOffscreenFormat;
     return allocate_image(kOffscreenFormat, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                          VK_IMAGE_ASPECT_COLOR_BIT, offscreen_);
+                          VK_IMAGE_ASPECT_COLOR_BIT, extent_, offscreen_);
 }
 
 bool VulkanDevice::create_swapchain() {
@@ -673,12 +742,17 @@ VulkanDevice::~VulkanDevice() {
         pipelines_.for_each([&](Pipeline& p) {
             vkDestroyPipeline(device_, p.pipeline, nullptr);
             vkDestroyPipelineLayout(device_, p.layout, nullptr);
+            if (p.set_layout) vkDestroyDescriptorSetLayout(device_, p.set_layout, nullptr);
         });
+        textures_.for_each([&](Texture& t) { destroy_image(t.image); });
+        if (linear_sampler_) vkDestroySampler(device_, linear_sampler_, nullptr);
+        if (nearest_sampler_) vkDestroySampler(device_, nearest_sampler_, nullptr);
         destroy_targets();
         destroy_image(offscreen_);
         if (swapchain_) vkDestroySwapchainKHR(device_, swapchain_, nullptr);
         if (query_pool_) vkDestroyQueryPool(device_, query_pool_, nullptr);
         for (Frame& f : frames_) {
+            if (f.descriptors) vkDestroyDescriptorPool(device_, f.descriptors, nullptr);
             if (f.image_available) vkDestroySemaphore(device_, f.image_available, nullptr);
             if (f.fence) vkDestroyFence(device_, f.fence, nullptr);
             if (f.pool) vkDestroyCommandPool(device_, f.pool, nullptr);
@@ -778,11 +852,42 @@ PipelineHandle VulkanDevice::create_graphics_pipeline(const GraphicsPipelineDesc
 
     Pipeline p;
     p.push_constant_size = desc.push_constant_size;
+    p.bindings = desc.bindings;
+
+    std::vector<VkDescriptorSetLayoutBinding> set_bindings;
+    std::vector<VkSampler> immutable(desc.bindings.size());
+    for (usize i = 0; i < desc.bindings.size(); ++i) {
+        const BindingDesc& b = desc.bindings[i];
+        VkDescriptorSetLayoutBinding lb{};
+        lb.binding = b.binding;
+        lb.descriptorCount = 1;
+        lb.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        if (b.type == BindingType::UniformBuffer) {
+            lb.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        } else {
+            lb.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            immutable[i] = sampler(b.filter);
+            lb.pImmutableSamplers = &immutable[i];
+        }
+        set_bindings.push_back(lb);
+    }
+    if (!set_bindings.empty()) {
+        VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        sli.bindingCount = static_cast<u32>(set_bindings.size());
+        sli.pBindings = set_bindings.data();
+        if (!vk_ok(vkCreateDescriptorSetLayout(device_, &sli, nullptr, &p.set_layout), "descriptor set layout")) {
+            return {};
+        }
+    }
+
     VkPushConstantRange range{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, desc.push_constant_size};
     VkPipelineLayoutCreateInfo lci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    lci.setLayoutCount = p.set_layout ? 1 : 0;
+    lci.pSetLayouts = &p.set_layout;
     lci.pushConstantRangeCount = desc.push_constant_size ? 1 : 0;
     lci.pPushConstantRanges = &range;
     if (!vk_ok(vkCreatePipelineLayout(device_, &lci, nullptr, &p.layout), "vkCreatePipelineLayout")) {
+        if (p.set_layout) vkDestroyDescriptorSetLayout(device_, p.set_layout, nullptr);
         return {};
     }
 
@@ -824,17 +929,29 @@ PipelineHandle VulkanDevice::create_graphics_pipeline(const GraphicsPipelineDesc
     // CCW front faces in world space; the Y flip in math::perspective preserves on-screen winding.
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.lineWidth = 1.0f;
+    if (desc.depth_bias) {
+        rs.depthBiasEnable = VK_TRUE;
+        rs.depthBiasConstantFactor = 1.5f;
+        rs.depthBiasSlopeFactor = 2.0f;
+    }
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     ds.depthTestEnable = desc.depth_test;
-    ds.depthWriteEnable = desc.depth_test;
-    ds.depthCompareOp = VK_COMPARE_OP_LESS;
+    ds.depthWriteEnable = desc.depth_test && desc.depth_write;
+    switch (desc.depth_compare) {
+    case CompareOp::Less: ds.depthCompareOp = VK_COMPARE_OP_LESS; break;
+    case CompareOp::LessOrEqual: ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL; break;
+    case CompareOp::Always: ds.depthCompareOp = VK_COMPARE_OP_ALWAYS; break;
+    }
     VkPipelineColorBlendAttachmentState blend{};
     blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
                            VK_COLOR_COMPONENT_A_BIT;
+    const VkFormat color_format =
+        desc.color_format == Format::BackBuffer ? color_format_ : to_vk(desc.color_format);
+    const bool has_color = color_format != VK_FORMAT_UNDEFINED;
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    cb.attachmentCount = 1;
+    cb.attachmentCount = has_color ? 1 : 0;
     cb.pAttachments = &blend;
     const std::array<VkDynamicState, 2> dyn_states{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
@@ -842,9 +959,9 @@ PipelineHandle VulkanDevice::create_graphics_pipeline(const GraphicsPipelineDesc
     dyn.pDynamicStates = dyn_states.data();
 
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachmentFormats = &color_format_;
-    rendering.depthAttachmentFormat = kDepthFormat;
+    rendering.colorAttachmentCount = has_color ? 1 : 0;
+    rendering.pColorAttachmentFormats = &color_format;
+    rendering.depthAttachmentFormat = to_vk(desc.depth_format);
 
     VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
     ci.stageCount = static_cast<u32>(stages.size());
@@ -861,9 +978,39 @@ PipelineHandle VulkanDevice::create_graphics_pipeline(const GraphicsPipelineDesc
     if (!vk_ok(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &ci, nullptr, &p.pipeline),
                "vkCreateGraphicsPipelines")) {
         vkDestroyPipelineLayout(device_, p.layout, nullptr);
+        if (p.set_layout) vkDestroyDescriptorSetLayout(device_, p.set_layout, nullptr);
         return {};
     }
-    return {pipelines_.add(p)};
+    return {pipelines_.add(std::move(p))};
+}
+
+TextureHandle VulkanDevice::create_texture(const TextureDesc& desc) {
+    NOVA_VERIFY(desc.width > 0 && desc.height > 0, "texture size must be non-zero");
+    Texture t;
+    t.format = to_vk(desc.format);
+    NOVA_VERIFY(t.format != VK_FORMAT_UNDEFINED, "texture needs a concrete format");
+    t.aspect = is_depth(t.format) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    t.extent = {desc.width, desc.height};
+    t.sampled = desc.sampled;
+    VkImageUsageFlags usage = 0;
+    if (desc.render_target) {
+        usage |= is_depth(t.format) ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    }
+    if (desc.sampled) {
+        usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+    }
+    if (!allocate_image(t.format, usage, t.aspect, t.extent, t.image)) {
+        destroy_image(t.image);
+        return {};
+    }
+    return {textures_.add(t)};
+}
+
+void VulkanDevice::destroy(TextureHandle handle) {
+    if (auto t = textures_.take(handle.id)) {
+        vkDeviceWaitIdle(device_);
+        destroy_image(t->image);
+    }
 }
 
 void VulkanDevice::destroy(BufferHandle handle) {
@@ -884,6 +1031,7 @@ void VulkanDevice::destroy(PipelineHandle handle) {
         vkDeviceWaitIdle(device_);
         vkDestroyPipeline(device_, p->pipeline, nullptr);
         vkDestroyPipelineLayout(device_, p->layout, nullptr);
+        if (p->set_layout) vkDestroyDescriptorSetLayout(device_, p->set_layout, nullptr);
     }
 }
 
@@ -937,6 +1085,8 @@ CommandList* VulkanDevice::begin_frame() {
 
     vkResetFences(device_, 1, &f.fence);
     vkResetCommandPool(device_, f.pool, 0);
+    vkResetDescriptorPool(device_, f.descriptors, 0);
+    cmd_list_.descriptors = f.descriptors;
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(f.cmd, &bi);
@@ -1055,44 +1205,89 @@ bool VulkanDevice::read_back(std::vector<u8>& rgba) {
 
 // ---------------------------------------------------------------- command list
 
-void VulkanCommandList::begin_render_pass(const ClearValues& clear) {
+void VulkanCommandList::begin_render_pass(const RenderPassDesc& desc) {
     NOVA_ASSERT(!in_pass, "render pass already open");
-    const std::array barriers{
-        image_barrier(device_.back_buffer_image(), VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
-                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-                      VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT),
-        image_barrier(device_.depth().image, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
-                      VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                      VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-                      VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                      VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-                      VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT),
-    };
-    cmd_barriers(cmd, barriers);
-    device_.back_buffer_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    constexpr VkPipelineStageFlags2 kDepthStages =
+        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    constexpr VkAccessFlags2 kDepthAccess =
+        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    // Attachments are always cleared, so previous contents are discarded (old layout UNDEFINED); the
+    // source stages still order this pass after earlier writes and shader reads of the same image.
+    constexpr VkPipelineStageFlags2 kPrevUse = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | kDepthStages |
+                                               VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+
+    std::array<VkImageMemoryBarrier2, 2> barriers{};
+    u32 barrier_count = 0;
+    pass_textures = {};
+    VkExtent2D extent{};
 
     VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    color.imageView = device_.back_buffer_view();
     color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    std::memcpy(color.clearValue.color.float32, clear.color, sizeof(clear.color));
+    std::memcpy(color.clearValue.color.float32, desc.clear.color, sizeof(desc.clear.color));
+    bool has_color = true;
+    if (desc.back_buffer) {
+        color.imageView = device_.back_buffer_view();
+        barriers[barrier_count++] = image_barrier(
+            device_.back_buffer_image(), VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, kPrevUse, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        device_.back_buffer_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        extent = device_.extent();
+    } else if (desc.color.valid()) {
+        Texture* t = device_.texture(desc.color);
+        NOVA_VERIFY(t && !is_depth(t->format), "invalid colour render target");
+        color.imageView = t->image.view;
+        barriers[barrier_count++] = image_barrier(
+            t->image.image, t->aspect, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, kPrevUse,
+            VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        t->layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        pass_textures[0] = t;
+        extent = t->extent;
+    } else {
+        has_color = false;
+    }
+
     VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    depth.imageView = device_.depth().view;
     depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
     depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depth.clearValue.depthStencil = {clear.depth, 0};
+    depth.clearValue.depthStencil = {desc.clear.depth, 0};
+    bool has_depth = true;
+    if (desc.depth.valid()) {
+        Texture* t = device_.texture(desc.depth);
+        NOVA_VERIFY(t && is_depth(t->format), "invalid depth render target");
+        depth.imageView = t->image.view;
+        depth.storeOp = t->sampled ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        barriers[barrier_count++] = image_barrier(t->image.image, t->aspect, VK_IMAGE_LAYOUT_UNDEFINED,
+                                                  VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, kPrevUse,
+                                                  VK_ACCESS_2_NONE, kDepthStages, kDepthAccess);
+        t->layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        pass_textures[1] = t;
+        if (!has_color) {
+            extent = t->extent;
+        }
+    } else if (desc.default_depth) {
+        depth.imageView = device_.depth().view;
+        depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        barriers[barrier_count++] = image_barrier(device_.depth().image, VK_IMAGE_ASPECT_DEPTH_BIT,
+                                                  VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                                                  kDepthStages, kDepthAccess, kDepthStages, kDepthAccess);
+        if (!has_color) {
+            extent = device_.extent();
+        }
+    } else {
+        has_depth = false;
+    }
+    NOVA_VERIFY(has_color || has_depth, "render pass needs at least one attachment");
+    cmd_barriers(cmd, {barriers.data(), barrier_count});
 
-    const VkExtent2D extent = device_.extent();
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
     ri.renderArea = {{0, 0}, extent};
     ri.layerCount = 1;
-    ri.colorAttachmentCount = 1;
+    ri.colorAttachmentCount = has_color ? 1 : 0;
     ri.pColorAttachments = &color;
-    ri.pDepthAttachment = &depth;
+    ri.pDepthAttachment = has_depth ? &depth : nullptr;
     vkCmdBeginRendering(cmd, &ri);
 
     const VkViewport viewport{0, 0, static_cast<f32>(extent.width), static_cast<f32>(extent.height), 0, 1};
@@ -1106,6 +1301,68 @@ void VulkanCommandList::end_render_pass() {
     NOVA_ASSERT(in_pass, "no render pass open");
     vkCmdEndRendering(cmd);
     in_pass = false;
+
+    // Make sampled render targets readable by later passes.
+    std::array<VkImageMemoryBarrier2, 2> barriers{};
+    u32 count = 0;
+    for (Texture* t : pass_textures) {
+        if (!t || !t->sampled) {
+            continue;
+        }
+        const bool d = is_depth(t->format);
+        barriers[count++] = image_barrier(
+            t->image.image, t->aspect, t->layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            d ? VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            d ? VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        t->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+    if (count > 0) {
+        cmd_barriers(cmd, {barriers.data(), count});
+    }
+    pass_textures = {};
+}
+
+void VulkanCommandList::bind_resources(std::span<const ResourceBinding> resources) {
+    NOVA_VERIFY(bound && bound->set_layout, "bound pipeline has no resource bindings");
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = descriptors;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &bound->set_layout;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    NOVA_VERIFY(vkAllocateDescriptorSets(device_.vk_device(), &ai, &set) == VK_SUCCESS,
+                "per-frame descriptor pool exhausted");
+
+    std::vector<VkWriteDescriptorSet> writes;
+    std::vector<VkDescriptorBufferInfo> buffer_infos;
+    std::vector<VkDescriptorImageInfo> image_infos;
+    buffer_infos.reserve(resources.size());
+    image_infos.reserve(resources.size());
+    for (const ResourceBinding& r : resources) {
+        const auto it = std::ranges::find_if(bound->bindings, [&](const BindingDesc& b) { return b.binding == r.binding; });
+        NOVA_VERIFY(it != bound->bindings.end(), "binding not declared by the pipeline");
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet = set;
+        w.dstBinding = r.binding;
+        w.descriptorCount = 1;
+        if (it->type == BindingType::UniformBuffer) {
+            Buffer* b = device_.buffer(r.buffer);
+            NOVA_VERIFY(b, "invalid uniform buffer");
+            buffer_infos.push_back({b->buffer, 0, b->size});
+            w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            w.pBufferInfo = &buffer_infos.back();
+        } else {
+            Texture* t = device_.texture(r.texture);
+            NOVA_VERIFY(t && t->layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        "texture must be written by an earlier pass before it is sampled");
+            image_infos.push_back({VK_NULL_HANDLE, t->image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w.pImageInfo = &image_infos.back();
+        }
+        writes.push_back(w);
+    }
+    vkUpdateDescriptorSets(device_.vk_device(), static_cast<u32>(writes.size()), writes.data(), 0, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, bound->layout, 0, 1, &set, 0, nullptr);
 }
 
 void VulkanCommandList::bind_pipeline(PipelineHandle handle) {

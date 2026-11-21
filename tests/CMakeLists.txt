@@ -29,3 +29,11 @@ if(TARGET nova_sandbox)
     add_test(NAME sandbox.headless_smoke COMMAND nova_sandbox --headless --frames 120)
     set_tests_properties(sandbox.headless_smoke PROPERTIES SKIP_RETURN_CODE 77)
 endif()
+
+# Smoke test: the village scene builds and renders offscreen with validation on.
+if(TARGET nova_village)
+    add_test(NAME village.headless_smoke
+             COMMAND nova_village --headless --validation --frames 4 --width 640 --height 360)
+    set_tests_properties(village.headless_smoke PROPERTIES SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION
+                         "Validation Error")
+endif()

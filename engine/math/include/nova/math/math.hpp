@@ -141,4 +141,34 @@ struct Mat4 {
     return r;
 }
 
+// Orthographic projection into Vulkan clip space (same conventions as perspective()).
+[[nodiscard]] constexpr Mat4 orthographic(f32 left, f32 right, f32 bottom, f32 top, f32 z_near, f32 z_far) noexcept {
+    Mat4 r = Mat4::identity();
+    r.m[0][0] = 2.0f / (right - left);
+    r.m[1][1] = -2.0f / (top - bottom);
+    r.m[2][2] = -1.0f / (z_far - z_near);
+    r.m[3][0] = -(right + left) / (right - left);
+    r.m[3][1] = (top + bottom) / (top - bottom);
+    r.m[3][2] = -z_near / (z_far - z_near);
+    return r;
+}
+
+[[nodiscard]] constexpr Vec3 transform_point(const Mat4& m, const Vec3& p) noexcept {
+    const Vec4 r = m * Vec4{p.x, p.y, p.z, 1.0f};
+    return {r.x, r.y, r.z};
+}
+
+// Transforms a normal by the inverse transpose of m's upper 3x3 (correct for non-uniform scale).
+[[nodiscard]] inline Vec3 transform_normal(const Mat4& m, const Vec3& n) noexcept {
+    const Vec3 c0{m.m[0][0], m.m[0][1], m.m[0][2]};
+    const Vec3 c1{m.m[1][0], m.m[1][1], m.m[1][2]};
+    const Vec3 c2{m.m[2][0], m.m[2][1], m.m[2][2]};
+    // The cofactor matrix equals det * inverse-transpose; the scale vanishes after normalizing.
+    const Vec3 r0 = cross(c1, c2), r1 = cross(c2, c0), r2 = cross(c0, c1);
+    return normalize(r0 * n.x + r1 * n.y + r2 * n.z);
+}
+
+[[nodiscard]] constexpr f32 lerp(f32 a, f32 b, f32 t) noexcept { return a + (b - a) * t; }
+[[nodiscard]] constexpr Vec3 lerp(const Vec3& a, const Vec3& b, f32 t) noexcept { return a + (b - a) * t; }
+
 } // namespace nova::math

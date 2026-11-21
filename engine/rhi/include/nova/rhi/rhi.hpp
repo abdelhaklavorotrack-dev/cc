@@ -26,11 +26,47 @@ struct Handle {
 using BufferHandle = Handle<struct BufferTag>;
 using ShaderHandle = Handle<struct ShaderTag>;
 using PipelineHandle = Handle<struct PipelineTag>;
+using TextureHandle = Handle<struct TextureTag>;
 
 enum class BufferUsage : u8 { Vertex, Index, Uniform };
 enum class ShaderStage : u8 { Vertex, Fragment };
 enum class VertexFormat : u8 { Float2, Float3, Float4 };
 enum class CullMode : u8 { None, Back };
+
+enum class Format : u8 {
+    Undefined,  // "no attachment" in pipeline descriptions
+    BackBuffer, // whatever format the swapchain / offscreen back buffer uses
+    RGBA8_sRGB,
+    RGBA16_Float,
+    D32_Float,
+};
+
+enum class CompareOp : u8 { Less, LessOrEqual, Always };
+enum class Filter : u8 { Linear, Nearest }; // clamp-to-edge addressing
+
+struct TextureDesc {
+    u32 width = 0;
+    u32 height = 0;
+    Format format = Format::RGBA8_sRGB;
+    bool render_target = true; // usable as a colour or depth attachment
+    bool sampled = true;       // readable from shaders after the pass that wrote it
+};
+
+enum class BindingType : u8 { UniformBuffer, SampledTexture };
+
+// One descriptor in set 0, visible to vertex and fragment stages.
+struct BindingDesc {
+    u32 binding = 0;
+    BindingType type = BindingType::UniformBuffer;
+    Filter filter = Filter::Linear; // SampledTexture only
+};
+
+// Value for one BindingDesc at draw time.
+struct ResourceBinding {
+    u32 binding = 0;
+    BufferHandle buffer;   // UniformBuffer
+    TextureHandle texture; // SampledTexture
+};
 
 struct BufferDesc {
     usize size = 0;
@@ -56,8 +92,14 @@ struct GraphicsPipelineDesc {
     u32 vertex_stride = 0;
     std::vector<VertexAttribute> attributes;
     u32 push_constant_size = 0; // visible to vertex and fragment stages, <= 128 bytes
+    std::vector<BindingDesc> bindings;
     CullMode cull = CullMode::Back;
     bool depth_test = true;
+    bool depth_write = true;
+    CompareOp depth_compare = CompareOp::Less;
+    bool depth_bias = false; // slope-scaled bias for shadow maps
+    Format color_format = Format::BackBuffer; // Undefined => depth-only pipeline
+    Format depth_format = Format::D32_Float;  // Undefined => no depth attachment
 };
 
 struct ClearValues {
@@ -65,16 +107,35 @@ struct ClearValues {
     f32 depth = 1.0f;
 };
 
+// Attachments for a render pass. Every attachment is cleared on load.
+// Colour: the back buffer if `back_buffer`, else `color` if valid, else none.
+// Depth: `depth` if valid, else the device's back-buffer-sized depth buffer if `default_depth`, else none.
+struct RenderPassDesc {
+    bool back_buffer = true;
+    TextureHandle color;
+    TextureHandle depth;
+    bool default_depth = true;
+    ClearValues clear;
+};
+
 // Records commands for the current frame. Valid between Device::begin_frame and end_frame.
 class CommandList {
 public:
     virtual ~CommandList() = default;
 
-    // Renders to the frame's back buffer (swapchain image or offscreen target) plus depth.
-    virtual void begin_render_pass(const ClearValues& clear) = 0;
+    virtual void begin_render_pass(const RenderPassDesc& desc) = 0;
+    // Back buffer + default depth.
+    void begin_render_pass(const ClearValues& clear) {
+        RenderPassDesc desc;
+        desc.clear = clear;
+        begin_render_pass(desc);
+    }
+    // Sampled render targets become shader-readable when their pass ends.
     virtual void end_render_pass() = 0;
 
     virtual void bind_pipeline(PipelineHandle pipeline) = 0;
+    // Binds descriptor set 0 of the current pipeline. Textures must not be attachments of the open pass.
+    virtual void bind_resources(std::span<const ResourceBinding> resources) = 0;
     virtual void bind_vertex_buffer(BufferHandle buffer, usize offset = 0) = 0;
     virtual void bind_index_buffer(BufferHandle buffer, usize offset = 0) = 0; // u32 indices
     virtual void push_constants(const void* data, u32 size) = 0;
@@ -119,10 +180,15 @@ public:
     virtual void update_buffer(BufferHandle buffer, const void* data, usize size, usize offset = 0) = 0;
     [[nodiscard]] virtual ShaderHandle create_shader(const ShaderDesc& desc) = 0;
     [[nodiscard]] virtual PipelineHandle create_graphics_pipeline(const GraphicsPipelineDesc& desc) = 0;
+    [[nodiscard]] virtual TextureHandle create_texture(const TextureDesc& desc) = 0;
     // Destruction waits for the GPU to go idle (simple and safe; fine outside the hot path).
     virtual void destroy(BufferHandle handle) = 0;
     virtual void destroy(ShaderHandle handle) = 0;
     virtual void destroy(PipelineHandle handle) = 0;
+    virtual void destroy(TextureHandle handle) = 0;
+
+    // Frames the CPU may record ahead of the GPU; per-frame buffers need this many copies.
+    [[nodiscard]] virtual u32 frames_in_flight() const noexcept = 0;
 
     // Returns nullptr when the frame must be skipped (e.g. minimized window).
     [[nodiscard]] virtual CommandList* begin_frame() = 0;

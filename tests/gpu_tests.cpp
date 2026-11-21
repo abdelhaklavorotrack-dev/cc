@@ -5,6 +5,7 @@
 #include "nova/core/assert.hpp"
 #include "nova/core/log.hpp"
 #include "nova/renderer/renderer.hpp"
+#include "nova/renderer/world_renderer.hpp"
 #include "nova/rhi/rhi.hpp"
 
 #include <doctest/doctest.h>
@@ -127,12 +128,57 @@ TEST_CASE("gpu: offscreen target resizes") {
     CHECK(device->back_buffer_extent().height == 16);
     rhi::CommandList* cmd = device->begin_frame();
     REQUIRE(cmd);
-    cmd->begin_render_pass({});
+    cmd->begin_render_pass(rhi::ClearValues{});
     cmd->end_render_pass();
     device->end_frame();
     std::vector<u8> rgba;
     REQUIRE(device->read_back(rgba));
     CHECK(rgba.size() == 32 * 16 * 4);
+    CHECK(device->validation_error_count() == 0);
+}
+
+TEST_CASE("gpu: world renderer casts sun shadows through the shadow map") {
+    constexpr u32 kW = 128, kH = 128;
+    auto device = make_device(kW, kH);
+    REQUIRE(device);
+    {
+        renderer::WorldRenderer world(*device, 512);
+        REQUIRE(world.valid());
+        // Material id 15 has no procedural detail, so pixels are flat albedo * lighting.
+        const math::Vec4 grey{0.5f, 0.5f, 0.5f, 15.0f};
+        renderer::MeshData ground, box;
+        renderer::append(ground, renderer::make_plane(20.0f), math::Mat4::identity(), grey);
+        renderer::append(box, renderer::make_cube(1.0f), math::translate({0, 1.0f, 0}), grey);
+        const renderer::WorldDrawItem items[] = {{world.upload(ground)}, {world.upload(box)}};
+
+        renderer::Camera camera;
+        camera.position = {0, 12, 0};
+        camera.target = {0, 0, 0};
+        camera.up = {0, 0, -1};
+        renderer::WorldSettings settings;
+        settings.sun_direction = {1, 1, 0}; // shadow falls towards -X
+        settings.fog_density = 0.0f;
+        settings.shadow_radius = 8.0f;
+        for (int i = 0; i < 2; ++i) {
+            REQUIRE(world.render_frame(camera, settings, items));
+        }
+
+        std::vector<u8> rgba;
+        REQUIRE(device->read_back(rgba));
+        const math::Mat4 vp = camera.projection(1.0f) * camera.view();
+        auto luma_at = [&](math::Vec3 p) {
+            const math::Vec4 c = vp * math::Vec4{p.x, p.y, p.z, 1};
+            const u32 x = static_cast<u32>((c.x / c.w * 0.5f + 0.5f) * kW);
+            const u32 y = static_cast<u32>((c.y / c.w * 0.5f + 0.5f) * kH);
+            const Pixel px = pixel_at(rgba, kW, std::min(x, kW - 1), std::min(y, kH - 1));
+            return px.r + px.g + px.b;
+        };
+        const int lit = luma_at({2.5f, 0, 0});
+        const int shadowed = luma_at({-1.4f, 0, 0});
+        INFO("lit=" << lit << " shadowed=" << shadowed);
+        CHECK(lit > 0);
+        CHECK(shadowed * 10 < lit * 6);
+    }
     CHECK(device->validation_error_count() == 0);
 }
 

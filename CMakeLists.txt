@@ -34,6 +34,7 @@ endif()
 
 if(NOVA_BUILD_SANDBOX AND NOVA_WITH_VULKAN)
     add_subdirectory(apps/sandbox)
+    add_subdirectory(apps/village)
 endif()
 
 if(NOVA_BUILD_TESTS)
